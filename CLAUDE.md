@@ -122,6 +122,8 @@ Breakeven win rate at 1:2 RR = 33.3%.
 4. Features + LightGBM, expanding-window walk-forward (see "Phase 4 plan"), threshold chosen on
    walk-forward OOS only. **Gate:** filtered expectancy beats baseline on walk-forward OOS AND holds
    on test with enough trades. If not → stop, report honestly.
+   **Result (2026-10-24): FAIL** — LR and LightGBM OOS AUC < 0.5; neither beats baseline or the rule
+   baseline. Test set untouched. See `reports/04_model.md`.
 5. ONNX export. **Gate:** onnxruntime vs LightGBM probabilities match (max abs diff < 1e-5).
 6. EA: same signals + same features + ONNX + CTrade, lot sizing via tick value, one position max,
    magic number, close all Friday 22:00 server time. Strategy Tester (real ticks) vs Python results.
