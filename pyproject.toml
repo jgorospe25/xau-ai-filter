@@ -1,0 +1,30 @@
+[project]
+name = "xauai"
+version = "0.1.0"
+description = "LightGBM filter on an EMA/RSI XAUUSD signal, deployed to MT5 via ONNX"
+readme = "README.md"
+authors = [
+    { name = "Joshua Gorospe", email = "angatngheaven@yahoo.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.2",
+    "metatrader5>=5.0.6231",
+    "numpy>=2.5.4",
+    "onnx>=1.23.2",
+    "onnxmltools>=1.16.0",
+    "onnxruntime>=1.31.0",
+    "pandas>=3.1.0",
+    "pyarrow>=26.0.0",
+    "scikit-learn>=1.9.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
