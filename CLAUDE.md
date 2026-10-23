@@ -26,13 +26,18 @@ Evaluated on **closed** bars only.
 - MT5 bar `spread` understates real costs (live spread ~0.26 vs historical p99 0.21).
 - Per-trade cost (price units) = **max(bar_spread × point, 0.30) + 0.05 slippage**.
   Zero-spread bars are data artifacts — the 0.30 floor covers them.
-- Sensitivity run: same with spread floor **0.50**. Report both.
+- Sensitivity runs at **total** cost 0.50 and 0.75 (spread floor 0.45 / 0.70 + 0.05). Base = 0.35.
+- Cost is applied by shifting the entry against the trade (buy at ask); SL/TP are set from that
+  fill and checked on bid bars. So SL = exactly −1R and cost shows up as fewer TP / more SL hits.
 - **Swap**: charged for each server-midnight (hour-0) rollover the position is held through,
-  ×3 on `swap_rollover3days` (MT5 day-of-week, 0=Sunday). Symbol swap fields are exported to
-  `data/raw/symbol_info.json` (`swap_mode`, `swap_long`, `swap_short`, `swap_rollover3days`).
+  ×3 for the rollover at the end of `swap_rollover3days` (MT5 day-of-week, 0=Sunday; 3 = Wed→Thu).
+  Symbol swap fields are exported to `data/raw/symbol_info.json` (`swap_mode`, `swap_long`,
+  `swap_short`, `swap_rollover3days`). Historical swap scaled by price:
+  `swap_now × close_at_signal / last_close`; flat current swap reported for comparison.
 
 ## Labels (triple barrier, must match the EA)
 - Entry = next bar open (+ cost above). SL/TP from signal-bar ATR.
+- **No entry** if the entry bar is at/after Friday 22:00, or follows a > 24-bar gap (stale signal).
 - SL and TP both inside one bar → loss.
 - **Gap-through fill**: if a bar opens beyond SL/TP, fill at that bar's open (losses can exceed 1R).
 - **Forced exits**: at the open of the **Friday 22:00** server bar; and at the close of the last
@@ -46,7 +51,17 @@ Evaluated on **closed** bars only.
 - Train: 2022-05-16 .. 2024-12-31
 - Validation: 2025-01-01 .. 2025-10-23
 - Test (touch once): 2025-10-24 .. 2026-10-23
-- Report signal counts per split at the Phase 3 gate.
+- Phase 3 baseline reports metrics on these three splits.
+
+## Phase 4 plan: expanding-window walk-forward
+- Out-of-sample period **2023-01-01 .. 2025-10-23**, in 6-month folds (2023-01, 2023-07, 2024-01,
+  2024-07, 2025-01, 2025-07 → 2025-10-23).
+- For each fold: train on **all labeled signals before the fold start** (expanding window),
+  predict the fold. Retrain every 6 months.
+- **Purge**: drop training samples whose trade exits at/after the fold start (label overlap).
+- Threshold and hyperparameters are chosen on the pooled walk-forward OOS predictions only.
+- The final **test set 2025-10-24 .. 2026-10-23 stays untouched** until the very end: one final
+  model trained on everything before 2025-10-24, evaluated once.
 
 ## Indicator parity gotchas (MT5 formulas)
 - `iMA` EMA: alpha = 2/(n+1); warm-up differences vanish after a few hundred bars — compare only after warm-up.
@@ -101,8 +116,9 @@ Breakeven win rate at 1:2 RR = 33.3%.
 1. Export max available H1 history; sanity report (date range, gaps, weekend bars, spread stats).
 2. Indicators + signals. **Gate:** matches `DumpSignals.mq5` CSV (signal times identical after warm-up).
 3. Labels + baseline backtest. **Gate:** ≥ ~300 signals total; report raw expectancy.
-4. Features + LightGBM + threshold chosen on validation only. **Gate:** filtered expectancy beats
-   baseline on validation AND holds on test with enough trades. If not → stop, report honestly.
+4. Features + LightGBM, expanding-window walk-forward (see "Phase 4 plan"), threshold chosen on
+   walk-forward OOS only. **Gate:** filtered expectancy beats baseline on walk-forward OOS AND holds
+   on test with enough trades. If not → stop, report honestly.
 5. ONNX export. **Gate:** onnxruntime vs LightGBM probabilities match (max abs diff < 1e-5).
 6. EA: same signals + same features + ONNX + CTrade, lot sizing via tick value, one position max,
    magic number, close all Friday 22:00 server time. Strategy Tester (real ticks) vs Python results.

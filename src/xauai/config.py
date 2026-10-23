@@ -18,6 +18,7 @@ REPORTS_DIR: Path = ROOT / "reports"
 RAW_H1_PATH: Path = RAW_DIR / "xauusd_h1.parquet"
 SYMBOL_INFO_PATH: Path = RAW_DIR / "symbol_info.json"
 MT5_DIR: Path = DATA_DIR / "mt5"  # CSVs copied from the terminal (DumpSignals etc.)
+LABELS_PATH: Path = DATA_DIR / "labels" / "trades_h1.parquet"  # base-case labels (Phase 3)
 
 # MT5 terminal data folder (File -> Open Data Folder)
 MT5_DATA_PATH: Path = Path(r"C:\Users\joshua\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075")
@@ -55,7 +56,8 @@ MIN_BARS: int = max(EMA_TREND, ATR_AVG_PERIOD + ATR_PERIOD) + 5
 
 # --- Costs (price units) ----------------------------------------------------
 SPREAD_FLOOR: float = 0.30  # cost spread = max(bar spread * point, floor); zero spreads are artifacts
-SPREAD_FLOOR_SENSITIVITY: float = 0.50  # second run
+# Sensitivity runs: TOTAL per-trade cost (spread floor + slippage); base case = 0.30 + 0.05 = 0.35
+SENSITIVITY_TOTAL_COSTS: tuple[float, ...] = (0.50, 0.75)
 SLIPPAGE: float = 0.05
 # Swap is read from data/raw/symbol_info.json (swap_mode, swap_long, swap_short, swap_rollover3days)
 ROLLOVER_HOUR: int = 0  # server hour at which swap is charged

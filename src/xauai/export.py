@@ -228,7 +228,7 @@ def build_report(df: pd.DataFrame, snap: dict, dropped_forming: bool) -> str:
     w(_md_table(pd.DataFrame({"quantile": [f"p{int(x * 100)}" for x in q], "spread": spread_q.round(5).to_numpy()})))
     w("")
     w(f"- Mean: {spread_px.mean():.5f}; zero-spread bars: {int((df['spread'] == 0).sum()):,} (data artifacts)")
-    for floor in (config.SPREAD_FLOOR, config.SPREAD_FLOOR_SENSITIVITY):
+    for floor in (config.SPREAD_FLOOR, *(c - config.SLIPPAGE for c in config.SENSITIVITY_TOTAL_COSTS)):
         w(f"- Bars where the {floor:.2f} cost floor binds: {(spread_px < floor).mean():.1%}")
     w(f"- Cost model: max(bar spread, floor) + {config.SLIPPAGE} slippage")
     w("")
