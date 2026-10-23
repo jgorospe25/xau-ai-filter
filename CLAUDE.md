@@ -29,6 +29,9 @@ Evaluated on **closed** bars only.
 - Sensitivity runs at **total** cost 0.50 and 0.75 (spread floor 0.45 / 0.70 + 0.05). Base = 0.35.
 - Cost is applied by shifting the entry against the trade (buy at ask); SL/TP are set from that
   fill and checked on bid bars. So SL = exactly −1R and cost shows up as fewer TP / more SL hits.
+- **EA requirement:** set SL/TP from the **actual fill price** of the position
+  (`PositionGetDouble(POSITION_PRICE_OPEN)`), not from the bar open or the signal close, using the
+  signal-bar ATR — exactly as the labels do. Otherwise live R will not match the labels.
 - **Swap**: charged for each server-midnight (hour-0) rollover the position is held through,
   ×3 for the rollover at the end of `swap_rollover3days` (MT5 day-of-week, 0=Sunday; 3 = Wed→Thu).
   Symbol swap fields are exported to `data/raw/symbol_info.json` (`swap_mode`, `swap_long`,

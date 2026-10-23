@@ -16,6 +16,7 @@ DATA_DIR: Path = ROOT / "data"
 RAW_DIR: Path = DATA_DIR / "raw"
 REPORTS_DIR: Path = ROOT / "reports"
 RAW_H1_PATH: Path = RAW_DIR / "xauusd_h1.parquet"
+RAW_D1_PATH: Path = RAW_DIR / "xauusd_d1.parquet"  # broker D1 bars, for the D1 trend feature
 SYMBOL_INFO_PATH: Path = RAW_DIR / "symbol_info.json"
 MT5_DIR: Path = DATA_DIR / "mt5"  # CSVs copied from the terminal (DumpSignals etc.)
 LABELS_PATH: Path = DATA_DIR / "labels" / "trades_h1.parquet"  # base-case labels (Phase 3)

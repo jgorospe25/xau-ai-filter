@@ -81,9 +81,9 @@ def fetch_rates(symbol: str, timeframe: int) -> pd.DataFrame:
     return df[KEEP_COLS]
 
 
-def drop_forming_bar(df: pd.DataFrame, server_now: pd.Timestamp) -> pd.DataFrame:
+def drop_forming_bar(df: pd.DataFrame, server_now: pd.Timestamp, bar: pd.Timedelta = BAR) -> pd.DataFrame:
     """Drop the last bar if it has not closed yet at the latest tick time."""
-    if len(df) and df["time"].iloc[-1] + BAR > server_now:
+    if len(df) and df["time"].iloc[-1] + bar > server_now:
         return df.iloc[:-1]
     return df
 
@@ -257,12 +257,15 @@ def main() -> None:
         server_now = pd.to_datetime(tick.time, unit="s") if tick else df["time"].iloc[-1] + BAR
         n_before = len(df)
         df = drop_forming_bar(df, server_now).reset_index(drop=True)
+        d1 = fetch_rates(config.SYMBOL, mt5.TIMEFRAME_D1)
+        d1 = drop_forming_bar(d1, server_now, pd.Timedelta(days=1)).reset_index(drop=True)
         snap = symbol_snapshot(config.SYMBOL)
     finally:
         mt5.shutdown()
 
     config.RAW_DIR.mkdir(parents=True, exist_ok=True)
     df.to_parquet(config.RAW_H1_PATH, index=False)
+    d1.to_parquet(config.RAW_D1_PATH, index=False)
     config.SYMBOL_INFO_PATH.write_text(json.dumps(snap, indent=2, default=str), encoding="utf-8")
     print(f"Saved {len(df):,} bars {df['time'].iloc[0]} -> {df['time'].iloc[-1]} to {config.RAW_H1_PATH}")
 
