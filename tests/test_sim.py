@@ -164,3 +164,149 @@ def test_no_trades_returns_full_columns() -> None:
                               pd.DataFrame({"session": [], "start": [], "end": []}))
     assert len(tr) == 0 and "r" in tr.columns and "exit_time" in tr.columns
     assert "taken" in one_position(tr).columns
+
+
+# --- limit orders (batch 2) -------------------------------------------------------------------
+from xauai import sim  # noqa: E402  (module import: batch-1 tests still collect before this exists)
+
+COST = CostParams()  # spread 0 -> 0.30 floor + 0.05 slippage = 0.35
+LOW = (9.8, 9.9, 9.7, 9.8)  # below a sell limit at 10.0
+TOUCH = (9.8, 10.2, 9.7, 9.9)  # reaches 10.0 from below
+
+
+def limit_frame(placed, d=-1, sl=11.0, limit_price=10.0, order_end=None, **kw):
+    placed = pd.Timestamp(placed)
+    row = dict.fromkeys(sim.LIMIT_SIGNAL_COLS, np.nan)
+    row.update(
+        signal_time=placed - pd.Timedelta(minutes=5), entry_time=placed, direction=d, sl=sl, setup="m1",
+        entry_tf="M5", trigger_tf="M5", level_kind="pdh", level_price=10.5,
+        ref_time=placed - pd.Timedelta(hours=1), limit_price=limit_price,
+        order_end=placed + pd.Timedelta(hours=1) if order_end is None else pd.Timestamp(order_end),
+    )
+    row.update(kw)
+    return pd.DataFrame([row], columns=list(sim.LIMIT_SIGNAL_COLS) + [k for k in kw if k not in sim.LIMIT_SIGNAL_COLS])
+
+
+def run_limit(rows, sig, tp_mode="rr2.0", start=MON, m1=None, live=None):
+    m1 = make_bars(rows, start, "min") if m1 is None else m1
+    return sim.simulate_limit_signals(sig, m1, COST, NO_SWAP, tp_mode, WINDOWS, None, live)
+
+
+def traded(orders):
+    return orders[orders["traded"]].reset_index(drop=True)
+
+
+def test_limit_fills_at_limit_price():
+    rows = [LOW] * 7 + [TOUCH] + [LOW] * 50
+    orders, s = run_limit(rows, limit_frame("2024-01-08 10:05"))
+    tr = traded(orders).iloc[0]
+    assert tr.entry == pytest.approx(10.0 - 0.35) and tr.cost == pytest.approx(0.35)
+    assert tr.entry_time == pd.Timestamp("2024-01-08 10:07") and tr.placed_at == pd.Timestamp("2024-01-08 10:05")
+    assert tr.sl_dist == pytest.approx(11.0 - 9.65) and tr.tp == pytest.approx(9.65 - 2 * 1.35)
+    assert tr.limit_price == 10.0 and tr.busy_until == tr.exit_time and tr.session == "london"
+    assert list(orders.columns) == sim.ORDER_COLS and s.empty
+
+
+def test_limit_gap_open_fills_at_open():
+    rows = [LOW] * 7 + [(10.3, 10.4, 10.2, 10.3)] + [LOW] * 50
+    orders, _ = run_limit(rows, limit_frame("2024-01-08 10:05"))
+    assert traded(orders).iloc[0].entry == pytest.approx(10.3 - 0.35)
+
+
+def test_limit_gap_through_sl_skipped_but_blocks():
+    rows = [LOW] * 7 + [(11.0, 11.2, 10.9, 11.0), LOW, (11.0, 11.6, 10.9, 11.0)] + [LOW] * 50
+    sig = pd.concat([
+        limit_frame("2024-01-08 10:05"),
+        limit_frame("2024-01-08 10:07", limit_price=11.5, sl=13.0, setup="blocked"),
+        limit_frame("2024-01-08 10:08", limit_price=11.5, sl=13.0, setup="free"),
+    ], ignore_index=True)
+    orders, s = run_limit(rows, sig)
+    assert s["reason"].tolist() == ["gap_through_sl"]
+    first = orders[orders["setup"] == "m1"].iloc[0]
+    assert not first.traded and first.busy_until == pd.Timestamp("2024-01-08 10:08")
+    out = sim.one_order(orders)
+    assert out["setup"].tolist() == ["blocked", "free"] and out["taken"].tolist() == [False, True]
+    assert out["taken"].dtype == bool
+
+
+def test_sl_in_fill_bar_is_loss():
+    rows = [LOW] * 7 + [(9.8, 11.2, 9.7, 9.9)] + [LOW] * 50
+    orders, _ = run_limit(rows, limit_frame("2024-01-08 10:05"))
+    tr = traded(orders).iloc[0]
+    assert tr.exit_reason == "sl" and tr.r_price == pytest.approx(-1.0) and tr.bars_held == 1
+
+
+def test_tp_in_fill_bar_not_counted():
+    rows = [LOW] * 7 + [(9.8, 10.2, 7.0, 9.9)] + [LOW] * 50  # tp = 9.65 - 1.5 * 1.35 = 7.625
+    orders, _ = run_limit(rows, limit_frame("2024-01-08 10:05"), tp_mode="rr1.5")
+    tr = traded(orders).iloc[0]
+    assert tr.exit_reason == "end_of_data" and tr.exit_time > pd.Timestamp("2024-01-08 10:07")
+
+
+def test_unfilled_order_expires_and_blocks():
+    rows = [LOW] * 120
+    sig = pd.concat([
+        limit_frame("2024-01-08 10:05", order_end="2024-01-08 11:05"),
+        limit_frame("2024-01-08 11:00", limit_price=9.85, setup="blocked"),
+        limit_frame("2024-01-08 11:05", limit_price=9.85, setup="free"),
+    ], ignore_index=True)
+    orders, s = run_limit(rows, sig)
+    assert s["reason"].tolist() == ["not_filled"]
+    first = orders[orders["setup"] == "m1"].iloc[0]
+    assert not first.traded and first.busy_until == pd.Timestamp("2024-01-08 11:05")
+    out = sim.one_order(orders)
+    assert out["setup"].tolist() == ["blocked", "free"] and out["taken"].tolist() == [False, True]
+
+
+def test_order_cancelled_at_friday_2200():
+    rows = [LOW] * 65 + [TOUCH] * 30  # Fri 21:00 ..; touch from 22:05
+    orders, s = run_limit(rows, limit_frame("2024-01-05 21:30"), start="2024-01-05 21:00")
+    assert s["reason"].tolist() == ["not_filled"] and not orders["traded"].any()
+    assert orders.iloc[0].busy_until == pd.Timestamp("2024-01-05 22:00")
+
+
+def test_order_cancelled_before_gap():
+    m1 = make_bars([LOW] * 30 + [TOUCH] * 30, MON, "min")
+    m1.loc[30:, "time"] += pd.Timedelta(hours=26)
+    orders, s = run_limit(None, limit_frame("2024-01-08 10:05", order_end="2024-01-10 10:05"), m1=m1)
+    assert s["reason"].tolist() == ["not_filled"] and not orders["traded"].any()
+    assert orders.iloc[0].busy_until == pd.Timestamp("2024-01-08 10:29")
+
+
+def test_live_mask_blocks_fill_outside_window():
+    rows = [LOW] * 7 + [TOUCH, LOW, TOUCH] + [LOW] * 50
+    live = np.ones(len(rows), bool)
+    live[7] = False
+    orders, _ = run_limit(rows, limit_frame("2024-01-08 10:05"), live=live)
+    assert traded(orders).iloc[0].entry_time == pd.Timestamp("2024-01-08 10:09")
+
+
+def test_drawn_sl_tp_from_fill():
+    rows = [LOW] * 7 + [TOUCH] + [LOW] * 50
+    sig = limit_frame("2024-01-08 10:05", sl=np.nan, null_sl_dist=2.0, null_tp_r=1.5)
+    orders, _ = run_limit(rows, sig, tp_mode="drawn")
+    tr = traded(orders).iloc[0]
+    fill = 10.0 - 0.35
+    assert tr.entry == pytest.approx(fill) and tr.sl == pytest.approx(fill + 2) and tr.tp == pytest.approx(fill - 3)
+
+
+def test_limit_cost_from_fill_bar_spread():
+    m1 = make_bars([LOW] * 7 + [TOUCH] + [LOW] * 50, MON, "min")
+    m1.loc[7, "spread"] = 50
+    orders, _ = run_limit(None, limit_frame("2024-01-08 10:05"), m1=m1)
+    tr = traded(orders).iloc[0]
+    assert tr.cost == pytest.approx(0.55) and tr.entry == pytest.approx(10.0 - 0.55)
+
+
+def test_limit_placement_skips_and_empty():
+    m1 = make_bars([LOW] * 60, MON, "min")
+    m1.loc[30:, "time"] += pd.Timedelta(hours=30)
+    orders, s = run_limit(None, limit_frame(m1.loc[30, "time"]), m1=m1)
+    assert orders.empty and s["reason"].tolist() == ["stale_after_gap"]
+    orders, s = run_limit([LOW] * 10, limit_frame("2024-01-08 11:00"))
+    assert orders.empty and s["reason"].tolist() == ["no_entry_bar"]
+    orders, s = run_limit([LOW] * 130, limit_frame("2024-01-05 22:00"), start="2024-01-05 21:00")
+    assert orders.empty and s["reason"].tolist() == ["entry_after_friday_close"]
+    empty = pd.DataFrame({c: [] for c in sim.LIMIT_SIGNAL_COLS})
+    orders, s = run_limit([LOW] * 10, empty)
+    assert list(orders.columns) == sim.ORDER_COLS and "taken" in sim.one_order(orders).columns
