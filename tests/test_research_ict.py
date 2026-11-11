@@ -271,3 +271,27 @@ def test_selection_best_per_model() -> None:
     )
     out = research.select(table)
     assert list(out["name"]) == ["b", "c"] and len(out) <= 3
+
+
+def test_run_ict_limit_empty_window() -> None:
+    sig = pd.DataFrame([limit_row(f"{DAY} 07:55", f"{DAY} 08:00", f"{DAY} 10:00", limit=99.5)])
+    inp = _inputs(_touch_m1())
+    inp.signals[("ict", "m1", "M5")] = sig[LIMIT_SIGNAL_COLS]
+    v = IctVariant("m1", "M5", "rr2.0", False, "none", True)
+    out, sk = run_ict_detail(v, inp, "2024-01-01", "2024-12-31")
+    assert len(out) == 0 and sk == {}
+    for col in ("signal_close", "signal_atr", "offset_atr", "taken", "variant", "setup", "entry_tf", "tp_mode"):
+        assert col in out.columns
+    assert research.flat_metrics(out)["n"] == 0
+    assert np.isnan(ict_null(v, out, inp, repeats=3)).all()
+
+
+def test_run_ict_limit_all_skipped_before_placement() -> None:
+    fri = "2025-10-17"  # Friday
+    m1 = make_bars([FLAT] * 120, f"{fri} 21:00", "1min")
+    sig = pd.DataFrame([limit_row(f"{fri} 21:55", f"{fri} 22:00", f"{fri} 23:00", limit=99.5)])
+    inp = _inputs(m1)
+    inp.signals[("ict", "m1", "M5")] = sig[LIMIT_SIGNAL_COLS]
+    out, sk = run_ict_detail(IctVariant("m1", "M5", "rr2.0", False, "none", True), inp, config.DEV_START, config.DEV_END)
+    assert len(out) == 0 and sk == {"entry_after_friday_close": 1}
+    assert {"offset_atr", "taken", "variant"} <= set(out.columns)

@@ -89,6 +89,16 @@ def ict_grid() -> list[IctVariant]:
     ]
 
 
+_GRID_INDEX: dict[IctVariant, int] = {}
+
+
+def _grid_index(v: IctVariant) -> int:
+    """Position of v in ict_grid() (cached map)."""
+    if not _GRID_INDEX:
+        _GRID_INDEX.update({g: i for i, g in enumerate(ict_grid())})
+    return _GRID_INDEX[v]
+
+
 # --- signals --------------------------------------------------------------------------------------
 def _boxes(inp: Inputs) -> pd.DataFrame:
     key = ("ict", "boxes")
@@ -143,6 +153,12 @@ def _cost_swap(inp: Inputs, total_cost: float) -> tuple[CostParams, SwapParams]:
 
 def _with_offsets(out: pd.DataFrame, sig: pd.DataFrame) -> pd.DataFrame:
     """Join signal_close / signal_atr from the signal table and add offset_atr = -d (limit - close) / ATR."""
+    if out.empty:  # nothing placed: the simulator's empty frame has object dtypes, so no merge
+        out = out.copy()
+        out["taken"] = out["taken"].astype(bool)
+        for col in ("signal_close", "signal_atr", "offset_atr"):
+            out[col] = pd.Series(dtype=float)
+        return out
     ref = sig[["signal_time", "direction", "signal_close", "signal_atr"]].drop_duplicates(["signal_time", "direction"])
     out = out.merge(ref, on=["signal_time", "direction"], how="left")
     out["offset_atr"] = -out["direction"] * (out["limit_price"] - out["signal_close"]) / out["signal_atr"]
@@ -248,7 +264,7 @@ def ict_null(
     taken = trades[trades["taken"].astype(bool)].reset_index(drop=True)
     if taken.empty:
         return np.full(repeats, np.nan)
-    offset = NULL_SEED_BASE + ict_grid().index(v)
+    offset = NULL_SEED_BASE + _grid_index(v)
     if v.model not in LIMIT_MODELS:
         cands = null_cands_ict(inp, v.entry_tf, v.time_filter)
         return research.null_distribution(v, trades, inp, repeats, seed, total_cost, cands=cands, seed_offset=offset)
