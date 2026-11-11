@@ -75,3 +75,44 @@ VAL_START: str = "2025-01-01"
 VAL_END: str = "2025-10-23"
 TEST_START: str = "2025-10-24"
 TEST_END: str = "2026-10-23"
+
+# --- Research (project 1): session-liquidity setups ---------------------------
+RESEARCH_RAW_DIR: Path = RAW_DIR / "research"
+
+
+def research_path(tf: str) -> Path:
+    """Raw bar parquet for a research timeframe, e.g. research_path("M1")."""
+    return RESEARCH_RAW_DIR / f"xauusd_{tf.lower()}.parquet"
+
+
+# Server time = UTC + 2 h, +1 h while America/New_York is in DST (verified in timeutil tests / data).
+SERVER_BASE_OFFSET_H: int = 2
+# name -> (IANA zone, local start hour, local end hour)
+SESSIONS: dict[str, tuple[str, int, int]] = {
+    "asia": ("Asia/Tokyo", 9, 17),
+    "london": ("Europe/London", 8, 17),
+    "ny": ("America/New_York", 8, 17),
+}
+HOLIDAY_GAP_HOURS: int = HOLIDAY_GAP_BARS + 1  # wall-clock gap (h) above which trades are force-closed
+
+DEV_START: str = "2022-05-16"
+DEV_END: str = "2025-10-23"
+
+# Fixed, pre-registered parameters (reported, never tuned)
+SWING_N: int = 2  # bars on each side of a swing
+RETEST_BARS: int = 12  # retest window K, entry-TF bars
+TOL_ATR: float = 0.10  # touch tolerance, x ATR14(entry TF)
+MERGE_ATR: float = 0.25  # level merge distance, x ATR14(H1)
+VP_BIN: float = 0.50  # volume-profile bin, price units
+VALUE_AREA: float = 0.70
+REJECT_WICK: float = 0.50  # rejection wick >= this fraction of bar range
+OB_RESET_ATR: float = 1.0  # 2b episode reset = zone top + this x ATR14(H1)
+FVG_BODY_ATR: float = 1.5  # FVG middle-bar body >= this x ATR14(H1)
+MIN_TP_R: float = 1.0  # minimum TP distance in R
+RR_MODES: tuple[float, ...] = (1.5, 2.0, 3.0)
+NULL_REPEATS: int = 200
+NULL_BEAT: float = 0.95
+SELECT_MIN_N: int = 100
+TEST_MIN_N: int = 30
+TEST_MIN_EXP: float = 0.10
+TEST_MIN_CI_LO: float = -0.10
