@@ -117,3 +117,16 @@ SELECT_MIN_N: int = 100
 TEST_MIN_N: int = 30
 TEST_MIN_EXP: float = 0.10
 TEST_MIN_CI_LO: float = -0.10
+
+# Batch 2: ICT entry models (pre-registered)
+DISPLACEMENT_MULT: float = 2.0  # displacement candle range >= this x ATR14
+DISPLACEMENT_N: int = 20
+OTE_LO: float = 0.62  # optimal trade entry retracement band
+OTE_HI: float = 0.79
+FILL_BARS: int = RETEST_BARS  # bars allowed for a limit fill
+ASIA_BOX: tuple[str, int, int] = ("America/New_York", 20, 24)  # local zone, start hour, end hour (24 = next midnight)
+TIME_FILTERS: dict[str, list[tuple[str, int, int]]] = {
+    "none": [],
+    "killzone": [("America/New_York", 2, 5), ("America/New_York", 7, 10)],
+    "owner": [("Asia/Manila", 8, 18)],
+}
