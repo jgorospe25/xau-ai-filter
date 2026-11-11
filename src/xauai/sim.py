@@ -22,6 +22,11 @@ SIGNAL_COLS = [
     "level_kind", "level_price", "ref_time", "target_ob", "target_fvg", "target_owner",
 ]
 TP_MODES = ("rr1.5", "rr2.0", "rr3.0", "next_level", "ob", "fvg", "owner")
+TRADE_COLS = [
+    "signal_time", "entry_time", "exit_time", "direction", "atr", "sl_dist", "cost", "entry", "sl", "tp",
+    "exit_price", "exit_reason", "bars_held", "nights", "swap_nights", "swap_r", "r_price", "r", "setup",
+    "entry_tf", "tp_mode", "session", "level_kind", "ref_time", "level_price",
+]
 _SKIP_COLS = ["signal_time", "direction", "reason", "setup"]
 
 
@@ -156,7 +161,7 @@ def simulate_signals(
                 "level_price": row["level_price"],
             }
         )
-    return pd.DataFrame(trades), pd.DataFrame(skipped, columns=_SKIP_COLS)
+    return pd.DataFrame(trades, columns=TRADE_COLS), pd.DataFrame(skipped, columns=_SKIP_COLS)
 
 
 def one_position(trades: pd.DataFrame) -> pd.DataFrame:

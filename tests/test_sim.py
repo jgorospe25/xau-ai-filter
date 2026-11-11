@@ -155,3 +155,12 @@ def test_one_position_tie_break():
     assert len(out) == 5
     assert out.loc[out["taken"], "id"].tolist() == ["early_ref_tight", "free"]
     assert out["taken"].dtype == bool
+
+
+def test_no_trades_returns_full_columns() -> None:
+    m1 = make_bars([(100.0, 100.5, 99.5, 100.0)] * 10, "2024-01-02 00:00", "1min")
+    empty_sig = pd.DataFrame({c: [] for c in SIGNAL_COLS})
+    tr, sk = simulate_signals(empty_sig, m1, CostParams(), SwapParams(0, 0, 0.01, 2), "rr2.0", False,
+                              pd.DataFrame({"session": [], "start": [], "end": []}))
+    assert len(tr) == 0 and "r" in tr.columns and "exit_time" in tr.columns
+    assert "taken" in one_position(tr).columns
