@@ -142,7 +142,7 @@ on M5 only.
   research symbol snapshot `data/raw/research/symbol_info.json`.
 - R = profit in units of the trade's own SL distance (entry fill to SL), net of cost and swap.
 - **Forced exits:** at the open of the first bar at or after Friday 22:00 server time; and at the close of the
-  last bar before any gap of more than 24 hours between bars (holidays). No bar-count timeout. No entry at or
+  last bar before a gap of more than 25 hours between two consecutive bars (i.e. more than 24 missing hourly bars, the same rule as Phase 3) (holidays). No bar-count timeout. No entry at or
   after Friday 22:00, and none after such a gap (stale signal).
 - **One position at a time per variant:** a position blocks only its own variant; signals of that variant that
   arrive while it is open are dropped. Same-bar ties: the earlier-detected level wins, then the nearer SL. Both
