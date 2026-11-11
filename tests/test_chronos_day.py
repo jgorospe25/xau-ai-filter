@@ -186,3 +186,89 @@ def test_simulate_days_skips_sl_behind_fill():
     trades, skipped = simulate_days(days, m1, _ZERO, _NOSWAP, 1.0, "tp2.0")
     assert trades.empty
     assert skipped.iloc[0]["reason"] == "sl_behind_fill"
+
+
+# ---- Task 3: forecasts -------------------------------------------------------------------------
+
+import sys
+
+from xauai import chronos_day as cd
+
+
+class FakePredictor:
+    def __init__(self, revision: str = "r1"):
+        self.model_id = "fake/model"
+        self.revision = revision
+        self.calls = 0
+
+    def predict_median(self, contexts: np.ndarray, horizons: np.ndarray) -> np.ndarray:
+        self.calls += 1
+        return contexts[:, -1] + np.arange(len(contexts))
+
+
+def _fc_inputs():
+    h1 = _bars("2024-01-01", "2024-03-01", "1h")  # ~1416 bars, 512 reached ~2024-01-22
+    days = pd.DataFrame({
+        "day": [pd.Timestamp("2024-01-10").date(), pd.Timestamp("2024-02-12").date(),
+                pd.Timestamp("2024-02-13").date()],
+        "h1_last_open": pd.to_datetime(["2024-01-10 04:00", "2024-02-12 04:00", "2024-02-13 04:00"]),
+        "horizon": [10, 9, 10],
+        "last_close": [0.0, 0.0, 0.0],
+    })
+    days["last_close"] = [float(h1.loc[h1["time"] == t, "close"].iloc[0]) for t in days["h1_last_open"]]
+    return days, h1
+
+
+def test_contexts_end_at_last_closed_bar():
+    days, h1 = _fc_inputs()
+    days = days.iloc[1:].reset_index(drop=True)
+    ctx = cd.contexts_for(days, h1)
+    assert ctx.shape == (2, 512) and ctx.dtype == np.float64
+    for i, t in enumerate(days["h1_last_open"]):
+        assert ctx[i, -1] == h1.loc[h1["time"] == t, "close"].iloc[0]
+        # the bar opening one hour later (still open at decision) is not included
+        nxt = h1.loc[h1["time"] == t + pd.Timedelta(hours=1), "close"].iloc[0]
+        assert nxt not in ctx[i]
+        assert ctx[i, 0] == h1.loc[h1["time"] == t - pd.Timedelta(hours=511), "close"].iloc[0]
+
+
+def test_forecast_days_warmup_dropped():
+    days, h1 = _fc_inputs()
+    assert cd.warmup_mask(days, h1, 512).tolist() == [True, False, False]
+    fc = cd.forecast_days(days, h1, FakePredictor())
+    assert list(fc.columns) == ["day", "last_close", "median", "horizon", "model_id", "revision"]
+    assert fc["day"].tolist() == days["day"].iloc[1:].tolist()
+    assert fc["median"].tolist() == [fc["last_close"].iloc[0], fc["last_close"].iloc[1] + 1]
+
+
+def test_forecast_cache_reused_and_invalidated(tmp_path):
+    days, h1 = _fc_inputs()
+    path = tmp_path / "f.parquet"
+    made: list[FakePredictor] = []
+
+    def factory(rev="r1"):
+        p = FakePredictor(rev)
+        made.append(p)
+        return p
+
+    a = cd.load_or_build_forecasts(days, h1, factory, path, model_id="fake/model", revision="r1")
+    assert made[0].calls == 1 and len(made) == 1
+    b = cd.load_or_build_forecasts(days, h1, factory, path, model_id="fake/model", revision="r1")
+    assert len(made) == 1  # reused: factory not even called
+    pd.testing.assert_frame_equal(a, b)
+    cd.load_or_build_forecasts(days, h1, lambda: factory("r2"), path, model_id="fake/model", revision="r2")
+    assert len(made) == 2 and made[1].calls == 1
+    # revision None: reuse when model_id matches and days are covered
+    c = cd.load_or_build_forecasts(days.iloc[1:2], h1, factory, path, model_id="fake/model")
+    assert len(made) == 2 and len(c) == 1
+    # uncovered day -> rebuild
+    more = days.copy()
+    more.loc[len(more)] = [pd.Timestamp("2024-02-14").date(), pd.Timestamp("2024-02-14 04:00"), 10, 0.0]
+    more.loc[len(more) - 1, "last_close"] = float(h1.loc[h1["time"] == pd.Timestamp("2024-02-14 04:00"), "close"].iloc[0])
+    cd.load_or_build_forecasts(more, h1, lambda: factory("r2"), path, model_id="fake/model", revision="r2")
+    assert len(made) == 3
+
+
+def test_unit_tests_do_not_import_chronos():
+    assert "chronos" not in sys.modules and "torch" not in sys.modules
+    assert hasattr(cd, "ChronosBoltPredictor")

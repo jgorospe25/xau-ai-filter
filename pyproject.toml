@@ -28,3 +28,6 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[project.optional-dependencies]
+chronos = ["chronos-forecasting", "torch"]

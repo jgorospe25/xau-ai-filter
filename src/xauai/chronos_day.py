@@ -6,13 +6,16 @@ UK and US DST switches (different dates) are handled by the zones, not by fixed 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
-from xauai import config
+from xauai import config, research
 from xauai.indicators import atr
 from xauai.labels import CostParams, SwapParams, gap_after_mask, just_before_close, rollovers, simulate_trade
 from xauai.timeutil import TF_LEN, utc_to_server
@@ -240,3 +243,102 @@ def simulate_days(
             "r": r_price + swap_px / dist, "taken": True,
         })
     return pd.DataFrame(trades, columns=TRADE_COLS), pd.DataFrame(skipped, columns=["day", "reason"])
+
+
+# ---- Forecasts ---------------------------------------------------------------------------------
+
+FORECAST_PATH = research.RESEARCH_DATA_DIR / "08_forecasts.parquet"  # development days only
+FORECAST_COLS = ["day", "last_close", "median", "horizon", "model_id", "revision"]
+_BATCH = 64
+
+
+class Predictor(Protocol):
+    model_id: str
+    revision: str
+
+    def predict_median(self, contexts: np.ndarray, horizons: np.ndarray) -> np.ndarray:
+        """contexts (n, 512) float -> (n,) 0.5 quantile at each row's step h."""
+        ...
+
+
+class ChronosBoltPredictor:
+    """Zero-shot Chronos-Bolt on CPU. chronos/torch/huggingface_hub are imported here only."""
+
+    def __init__(self, model_id: str = config.CHRONOS_MODEL):
+        import torch
+        from chronos import BaseChronosPipeline
+        from huggingface_hub import HfApi
+
+        self.model_id = model_id
+        try:
+            self.revision = str(HfApi().model_info(model_id).sha)
+        except Exception as exc:  # offline etc.
+            print(f"WARNING: could not resolve revision of {model_id}: {exc}")
+            self.revision = "unknown"
+        self._torch = torch
+        self._pipe = BaseChronosPipeline.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.float32)
+
+    def predict_median(self, contexts: np.ndarray, horizons: np.ndarray) -> np.ndarray:
+        out = np.empty(len(contexts), dtype=np.float64)
+        for s in range(0, len(contexts), _BATCH):
+            ctx = self._torch.tensor(np.asarray(contexts[s:s + _BATCH], dtype=np.float32))
+            hz = horizons[s:s + _BATCH]
+            q, _ = self._pipe.predict_quantiles(
+                context=ctx, prediction_length=int(hz.max()), quantile_levels=[0.5]
+            )
+            q = q.numpy()
+            out[s:s + len(hz)] = q[np.arange(len(hz)), hz.astype(int) - 1, 0]
+        return out
+
+
+def _last_idx(days: pd.DataFrame, h1: pd.DataFrame) -> np.ndarray:
+    """Index of the H1 bar with open == h1_last_open (inclusive upper bound), per day."""
+    t = h1["time"].to_numpy()
+    return np.searchsorted(t, days["h1_last_open"].to_numpy(), side="right") - 1
+
+
+def warmup_mask(days: pd.DataFrame, h1: pd.DataFrame, n: int = config.CHRONOS_CONTEXT) -> np.ndarray:
+    """True where fewer than n H1 bars exist with open <= h1_last_open (day is a warm-up skip)."""
+    return _last_idx(days, h1) + 1 < n
+
+
+def contexts_for(days: pd.DataFrame, h1: pd.DataFrame, n: int = config.CHRONOS_CONTEXT) -> np.ndarray:
+    """(len(days), n) float64: the n closes ending at the bar opening at h1_last_open, inclusive."""
+    close = h1["close"].to_numpy(dtype=np.float64)
+    idx = _last_idx(days, h1)
+    if (idx + 1 < n).any():
+        raise ValueError("days with fewer than n H1 bars; drop them with warmup_mask first")
+    return np.stack([close[i - n + 1:i + 1] for i in idx]) if len(idx) else np.empty((0, n))
+
+
+def forecast_days(days: pd.DataFrame, h1: pd.DataFrame, predictor: Predictor) -> pd.DataFrame:
+    """One row per day with a full context; warm-up days are dropped (see warmup_mask)."""
+    d = days.loc[~warmup_mask(days, h1)].reset_index(drop=True)
+    if d.empty:
+        return pd.DataFrame(columns=FORECAST_COLS)
+    med = predictor.predict_median(contexts_for(d, h1), d["horizon"].to_numpy(dtype=int))
+    return pd.DataFrame({
+        "day": d["day"], "last_close": d["last_close"].astype(float), "median": np.asarray(med, dtype=float),
+        "horizon": d["horizon"].astype(int), "model_id": predictor.model_id, "revision": predictor.revision,
+    })[FORECAST_COLS]
+
+
+def load_or_build_forecasts(
+    days: pd.DataFrame, h1: pd.DataFrame, predictor_factory: Callable[[], Predictor], path=FORECAST_PATH,
+    model_id: str = config.CHRONOS_MODEL, revision: str | None = None,
+) -> pd.DataFrame:
+    """Reuse the cache when model_id (and revision, if given) match and every forecastable day is in
+    it; else build with predictor_factory() and save. Returns rows for the requested days only."""
+    path = Path(path)
+    want = days.loc[~warmup_mask(days, h1), "day"]
+    if path.exists():
+        cache = pd.read_parquet(path)
+        ok = len(cache) > 0 and (cache["model_id"] == model_id).all()
+        if ok and revision is not None:
+            ok = bool((cache["revision"] == revision).all())
+        if ok and set(want) <= set(cache["day"]):
+            return cache[cache["day"].isin(set(want))].reset_index(drop=True)
+    fc = forecast_days(days, h1, predictor_factory())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fc.to_parquet(path, index=False)
+    return fc
