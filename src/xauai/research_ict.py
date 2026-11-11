@@ -599,9 +599,17 @@ def final_main() -> None:
     marker = config.REPORTS_DIR / MARKER_NAME
     if marker.exists():
         raise SystemExit(f"{marker} exists: the test set was already run once and must not be run again.")
-    sel = json.loads((RESEARCH_DATA_DIR / "07_selected.json").read_text(encoding="utf-8"))["selected"]
+    selfile = json.loads((RESEARCH_DATA_DIR / "07_selected.json").read_text(encoding="utf-8"))
+    if selfile.get("smoke"):
+        raise SystemExit("07_selected.json comes from a smoke run: run the full development grid first.")
+    sel = selfile["selected"]
     report = config.REPORTS_DIR / REPORT_NAME
     if not sel:
+        marker.write_text(
+            json.dumps({"selected": [], "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "note": "Test not run because nothing was selected."}, indent=2),
+            encoding="utf-8",
+        )
         _replace_test_section(report, ict_test_section_md([]))
         print(TEST_NOT_RUN_TEXT)
         return
@@ -735,7 +743,7 @@ def build_ict_results(
 
     L += ["### Results by session and by Philippine time", "",
           f"For each model's `{BASE_SUFFIX[1:]}` variant. Session = the session the trade was filled in (asia / "
-          "london / ny, as in batch 1; none = outside all three). PH band = fill time in Asia/Manila: 08-18 (day), "
+          "london / ny, as in batch 1; a time between two sessions gets the next session to start; none only appears beyond the window table). PH band = fill time in Asia/Manila: 08-18 (day), "
           "18-02 (evening), 02-08 (night). n / exp R / total R = one position at a time; the every-signal columns "
           "trade every signal.", ""]
     L += session_band_md(by_name)
@@ -780,7 +788,9 @@ def build_ict_results(
           "- Model 5 stops are not capped (designer's call, fixed before any result).",
           f"- {cum} variants have been tried across both batches; with {cum_e} eligible, a few can pass the "
           "development checks by luck. The test set is the only honest check.",
-          "- **The test set has NOT been touched.** It is run once, in Task 8, only for selected variants.", ""]
+          "- With a time filter on, the stop is the highest high up to the MSS bar. Price can run past it while the "
+          "order is not live, and the order can still fill later inside the window.",
+          "- **The test set has NOT been touched.** It is run once, with `--final`, only for selected variants.", ""]
     L += ict_test_section_md(table.loc[table["selected"], "name"].tolist())
     return "\n".join(L)
 

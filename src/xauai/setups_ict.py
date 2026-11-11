@@ -78,6 +78,8 @@ def _model1_zone(
         q0 += 1
         s, tip = swing[j], h[j]
         seen = bool(disp[j])
+        # Current behaviour: if the failed-break close c[j] is already beyond the swing s, no check requires
+        # c[j] >= s; any later close beyond s after a displacement bar counts as the MSS. Rare, left as is.
         mss = -1
         stop = min(j + k, n - 1)
         q = j + 1

@@ -497,12 +497,23 @@ def test_ict_final_refuses_second_run(tmp_path, monkeypatch) -> None:
 def test_ict_final_empty_selection_does_not_load_test_data(tmp_path, monkeypatch) -> None:
     rdir = _ict_final_env(tmp_path, monkeypatch, [])
     research_ict.main(["--final"])
-    assert not (rdir / research_ict.MARKER_NAME).exists()
+    marker = json.loads((rdir / research_ict.MARKER_NAME).read_text())
+    assert marker["selected"] == [] and "not run" in marker["note"]
     text = (rdir / research_ict.REPORT_NAME).read_bytes().decode()
     assert research.TEST_HEADING in text and research_ict.TEST_NOT_RUN_TEXT in text
     assert "\r" not in text and text.startswith("pre\n" + research_ict.MARKER)
-    research_ict.main(["--final"])  # idempotent
+    with pytest.raises(SystemExit):  # the marker now locks the test set
+        research_ict.main(["--final"])
     assert (rdir / research_ict.REPORT_NAME).read_bytes().decode().count(research.TEST_HEADING) == 1
+
+
+def test_ict_final_refuses_smoke_selection(tmp_path, monkeypatch) -> None:
+    rdir = _ict_final_env(tmp_path, monkeypatch, ["m1|M5|rr2.0|nodir|none"])
+    (research_ict.RESEARCH_DATA_DIR / "07_selected.json").write_text(
+        json.dumps({"smoke": True, "selected": ["m1|M5|rr2.0|nodir|none"]}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        research_ict.main(["--final"])
+    assert not (rdir / research_ict.MARKER_NAME).exists()
 
 
 def test_ict_final_writes_marker_before_computing(tmp_path, monkeypatch) -> None:
