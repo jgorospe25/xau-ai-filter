@@ -33,7 +33,7 @@ The routine being tested, one trade per day:
 - **Days:** Monday to Friday (by PH date). If a holiday or gap removes the decision H1 bar, the entry M1 bar
   (must be within 5 minutes of 10:00 PH) or the exit M1 bar (within 5 minutes of 12:00 London), or if
   ATR14 is not available, there is no trade that day. It is counted as a skip and never shifted to another time.
-- A trade is also skipped if its entry bar follows a gap of more than 24 hours or falls at or after Friday 22:00
+- A trade is also skipped if its entry bar follows a gap of more than 25 hours or falls at or after Friday 22:00
   server time, if no M1 bar exists between entry and exit, or if the stop would not be behind the fill. The
   report lists every skip reason with its count.
 
@@ -88,7 +88,7 @@ The routine being tested, one trade per day:
 Each Chronos version is compared on the **same days, same entry, same exits and stops**. Only the direction
 differs.
 1. **Coin flip:** 200 runs, each with a random direction per traded day. The days are the version's own traded
-   days (after the flat filter and skips). The random draws are seeded with the batch's null seed plus the
+   days (after the flat filter and skips). The random draws are seeded with the batch's null seed plus 3000 plus the
    version's position in the grid, so a version's coin flips are repeatable and differ between versions.
 2. **Overnight direction:** the sign of (close at the decision time minus the price at the previous weekday's
    time exit). That is the move from mid-London yesterday, through New York and early Tokyo, i.e. what you
