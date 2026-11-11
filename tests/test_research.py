@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
+import pytest
 from conftest import make_bars
 
 from xauai import config, research
@@ -259,3 +262,65 @@ def test_assert_dev_only_rejects_test_period_trades() -> None:
     except AssertionError:
         return
     raise AssertionError("expected a test-period leak to be rejected")
+
+
+def _unescaped_pipes(line: str) -> int:
+    import re
+
+    return len(re.findall(r"(?<!\\)\|", line))
+
+
+def test_variant_names_are_escaped_in_table_cells() -> None:
+    table = pd.DataFrame(
+        [
+            {
+                "name": "1|M5|rr2.0|notrend|hold", "setup": "1", "entry_tf": "M5", "eligible": True, "n": 5,
+                "n_signals": 6, "win_rate": 0.4, "expectancy_R": 0.1, "ci95_low": -0.1, "ci95_high": 0.3,
+                "total_R": 0.5, "profit_factor": 1.1, "selected": False, "null_runs": 0,
+            }
+        ]
+    )
+    md = research.all_variants_md(table)
+    header, _, row = md.splitlines()
+    assert _unescaped_pipes(row) == _unescaped_pipes(header)
+    assert r"1\|M5\|rr2.0\|notrend\|hold" in row
+    cmp_md = research.comparison_md(table)
+    h, _, r = cmp_md.splitlines()
+    assert _unescaped_pipes(r) == _unescaped_pipes(h)
+    out = research.selection_outcome(table.assign(beat_share=np.nan, **{f"exp_{y}": 0.1 for y in research.SELECT_YEARS}), "1")
+    cell = research._md([{"setup": "x", "details": out[1]}]).splitlines()[2]
+    assert _unescaped_pipes(cell) == 3
+
+
+def _final_env(tmp_path, monkeypatch, selected: list[str]):
+    rdir = tmp_path / "reports"
+    ddir = tmp_path / "data"
+    rdir.mkdir()
+    ddir.mkdir()
+    monkeypatch.setattr(config, "REPORTS_DIR", rdir)
+    monkeypatch.setattr(research, "RESEARCH_DATA_DIR", ddir)
+    (ddir / "06_selected.json").write_text(json.dumps({"selected": selected}), encoding="utf-8")
+    (rdir / research.REPORT_NAME).write_text("pre\n" + research.MARKER + "\nbody\n", encoding="utf-8")
+    return rdir
+
+
+def test_final_refuses_second_run(tmp_path, monkeypatch) -> None:
+    rdir = _final_env(tmp_path, monkeypatch, ["1|M5|rr2.0|notrend|hold"])
+    (rdir / "06_test_done.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(research, "load_inputs", lambda: (_ for _ in ()).throw(AssertionError("loaded")))
+    with pytest.raises(SystemExit):
+        research.main(["--final"])
+
+
+def test_final_with_empty_selection_does_not_touch_test_data(tmp_path, monkeypatch) -> None:
+    rdir = _final_env(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(research, "load_inputs", lambda: (_ for _ in ()).throw(AssertionError("loaded")))
+    research.main(["--final"])
+    assert not (rdir / "06_test_done.json").exists()
+    text = (rdir / research.REPORT_NAME).read_text(encoding="utf-8")
+    assert "## Test set (Part C)" in text
+    assert research.NOT_RUN_TEXT in text
+    assert text.startswith("pre\n" + research.MARKER)
+    # idempotent: a second call replaces the section instead of duplicating it
+    research.main(["--final"])
+    assert (rdir / research.REPORT_NAME).read_text(encoding="utf-8").count("## Test set (Part C)") == 1

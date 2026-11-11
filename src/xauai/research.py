@@ -467,10 +467,18 @@ def _ci(lo: float, hi: float) -> str:
     return "—" if pd.isna(lo) else f"[{lo:+.3f}, {hi:+.3f}]"
 
 
+def _esc(x: object) -> object:
+    """Escape `|` for a markdown table cell (variant names contain it; backticks do not protect it in GFM)."""
+    return x.replace("|", "\\|") if isinstance(x, str) else x
+
+
 def _md(rows: list[dict]) -> str:
     from xauai.md import table as md_table
 
-    return md_table(pd.DataFrame(rows)) if rows else "_none_"
+    if not rows:
+        return "_none_"
+    df = pd.DataFrame(rows)
+    return md_table(df.rename(columns=_esc).map(_esc))
 
 
 def all_variants_md(table: pd.DataFrame) -> str:
@@ -806,6 +814,7 @@ def build_results(results: list[VariantResult], table: pd.DataFrame, out_dir, ru
           f"- {len(table)} variants were tried; with {len(elig)} eligible, a few can pass the development checks by luck. "
           "The test set is the only honest check.",
           "- **The test set has NOT been touched.** It is run once, in Part C, only for selected variants.", ""]
+    L += test_section_md(table.loc[table["selected"], "name"].tolist())
     return "\n".join(L)
 
 
@@ -818,6 +827,86 @@ def write_report(results_md: str, path) -> None:
     path.write_text(pre + results_md, encoding="utf-8")
 
 
+# --- Task 13: Part C (test set, one run) ---------------------------------------------------------
+TEST_HEADING = "## Test set (Part C)"
+NOT_RUN_TEXT = (
+    "Not run: no setup was selected in Part B. Per the pre-registration, the test period "
+    "2025-10-24 .. 2026-10-23 stays untouched."
+)
+MARKER_NAME = "06_test_done.json"
+
+
+def _test_marker():
+    return config.REPORTS_DIR / MARKER_NAME
+
+
+def test_section_md(selected: list[str], results: pd.DataFrame | None = None) -> list[str]:
+    """Lines of the Test set section: not-run text, pending text, or the one-time results table."""
+    if results is not None:
+        rows = [{
+            "variant": r["name"], "n": int(r["n"]), "exp R": _f(r["expectancy_R"]),
+            "95% CI": _ci(r["ci95_low"], r["ci95_high"]), "verdict": r["verdict"],
+        } for _, r in results.iterrows()]
+        body = [_md(rows), "",
+                f"PASS = expectancy >= {config.TEST_MIN_EXP:+.2f}R, n >= {config.TEST_MIN_N} and CI low > "
+                f"{config.TEST_MIN_CI_LO:+.2f}R. Bootstrap 95% CI, 10,000 resamples. Run once.", ""]
+    elif not selected:
+        body = [NOT_RUN_TEXT, ""]
+    elif _test_marker().exists():
+        body = [f"Run once; see reports/{MARKER_NAME}.", ""]
+    else:
+        body = ["Not yet run. Selected: " + ", ".join(f"`{n}`" for n in selected) + ".", ""]
+    return ["", TEST_HEADING, ""] + body
+
+
+def run_test_set(selected: pd.DataFrame, inp: Inputs) -> pd.DataFrame:
+    """Test period TEST_START..TEST_END for each selected variant (one position at a time), net of costs.
+    Verdict PASS needs expectancy >= TEST_MIN_EXP, n >= TEST_MIN_N and bootstrap CI low > TEST_MIN_CI_LO."""
+    by_name = {v.name: v for v in variant_grid()}
+    rows = []
+    for name in selected["name"]:
+        tr, _ = run_variant_detail(by_name[name], inp, config.TEST_START, config.TEST_END)
+        r = tr.loc[tr["taken"].astype(bool), "r"].to_numpy(float)
+        lo, hi = bootstrap_ci(r)
+        exp = float(r.mean()) if len(r) else float("nan")
+        ok = len(r) >= config.TEST_MIN_N and exp >= config.TEST_MIN_EXP and lo > config.TEST_MIN_CI_LO
+        rows.append({"name": name, "n": len(r), "expectancy_R": exp, "ci95_low": lo, "ci95_high": hi,
+                     "verdict": "PASS" if ok else "FAIL"})
+    return pd.DataFrame(rows, columns=["name", "n", "expectancy_R", "ci95_low", "ci95_high", "verdict"])
+
+
+def replace_test_section(report_path, lines: list[str]) -> None:
+    """Replace (or append) the Test set section of the report, leaving everything else unchanged."""
+    text = report_path.read_text(encoding="utf-8")
+    new = "\n".join(lines).strip("\n") + "\n"
+    i = text.find(TEST_HEADING)
+    if i < 0:
+        text = text.rstrip("\n") + "\n\n" + new
+    else:
+        j = text.find("\n## ", i + 1)
+        text = text[:i] + new + (text[j:] if j >= 0 else "")
+    report_path.write_text(text, encoding="utf-8")
+
+
+def final_main() -> None:
+    marker = _test_marker()
+    if marker.exists():
+        raise SystemExit(f"{marker} exists: the test set was already run once and must not be run again.")
+    sel = json.loads((RESEARCH_DATA_DIR / "06_selected.json").read_text(encoding="utf-8"))["selected"]
+    report = config.REPORTS_DIR / REPORT_NAME
+    if not sel:
+        replace_test_section(report, test_section_md([]))
+        print(NOT_RUN_TEXT)
+        return
+    marker.write_text(
+        json.dumps({"selected": sel, "timestamp": datetime.now().isoformat(timespec="seconds")}, indent=2),
+        encoding="utf-8",
+    )
+    res = run_test_set(pd.DataFrame({"name": sel}), load_inputs())
+    replace_test_section(report, test_section_md(sel, res))
+    print(res.to_string(index=False))
+
+
 def _log(msg: str, t0: float) -> None:
     print(f"[{(time.time() - t0) / 60:6.1f} min] {msg}", flush=True)
 
@@ -826,7 +915,11 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Part B: development backtests, null baseline, selection")
     ap.add_argument("--smoke", action="store_true",
                     help="run a handful of variants with 3 null repeats; writes to data/research/smoke/, not reports/")
+    ap.add_argument("--final", action="store_true",
+                    help="Part C: run the selected variants on the test period ONCE (refuses a second run)")
     args = ap.parse_args(argv)
+    if args.final:
+        return final_main()
     t0 = time.time()
     smoke = args.smoke
     out_dir = RESEARCH_DATA_DIR / "smoke" if smoke else config.REPORTS_DIR

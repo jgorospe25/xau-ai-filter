@@ -89,6 +89,17 @@ src/xauai/
   backtest.py      # expectancy / win rate / drawdown in R
   train.py         # time-ordered splits, LightGBM, threshold selection
   export_onnx.py   # LightGBM → ONNX + parity check
+  # session & liquidity research (rules only, M1/M5/.. bars; see reports/05_levels.md, 06_setups.md)
+  timeutil.py      # server time <-> UTC, trading-session windows
+  structure.py     # no-lookahead swing points and trend state
+  zones.py         # H1 order blocks and fair value gaps (known_at / invalid_at)
+  profile.py       # volume profile (POC / value area) from M1 bars
+  levels.py        # level table: PDH/PDL, PWH/PWL, session H/L, swings, profile
+  setups.py        # setups 1 (sweep, reclaim, retest) and 3 (lower high, break, continue)
+  setups_ob.py     # setups 2a (rejection at a level) and 2b (pullback from the H1 OB)
+  sim.py           # generalised M1 trade simulator for setup signals, in R net of costs
+  levelstudy.py    # Part A: level touch/reversal study and FVG fill study
+  research.py      # Part B/C: 208-variant grid, null baseline, selection, one-time test (--final)
 mql5/
   XAU_EMA_RSI_Signal.mq5   # existing indicator (do not change rules)
   DumpSignals.mq5          # script: iCustom on indicator → CSV for parity tests
@@ -128,6 +139,10 @@ Breakeven win rate at 1:2 RR = 33.3%.
 6. EA: same signals + same features + ONNX + CTrade, lot sizing via tick value, one position max,
    magic number, close all Friday 22:00 server time. Strategy Tester (real ticks) vs Python results.
 7. Demo forward test ≥ 4 weeks before any live cent-account use.
+8. Research (not an EA phase): session & liquidity setups, rules only (no ML), pre-registered.
+   **Result (2026-11-11): FAIL** — 208 variants (64 eligible M5) tested on 2022-05-16..2025-10-23 with real
+   costs; no eligible variant was positive in every year; nothing selected; test set untouched. See
+   `reports/05_levels.md` (no level beat random) and `reports/06_setups.md`.
 
 ## Conventions
 - Type hints, small pure functions, pytest for indicators/labels/parity.
