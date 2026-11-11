@@ -14,3 +14,6 @@ data/
 
 # Tooling caches
 .pytest_cache/
+
+# Superpowers working docs (specs/plans) stay local
+docs/superpowers/
