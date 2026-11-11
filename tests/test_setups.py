@@ -214,12 +214,38 @@ def test_setup3_lower_high_break_retest_sell_target_pdl():
     assert np.isnan(r["target_ob"]) and np.isnan(r["target_fvg"])
 
 
-def test_setup3_target_is_nearer_swing_low_before_pdl():
+def test_setup3_target_is_unswept_swing_low_nearest_pdl():
     warm = list(WARM)
-    warm[3] = (100.0, 101.0, 97.0, 100.0)  # swing low 97 at bar 3, known at close of bar 5
+    warm[3] = (100.0, 101.0, 96.0, 100.0)  # swing low 96, later swept by bar 8
+    warm[8] = (100.0, 101.0, 94.5, 100.0)  # swing low 94.5: below the PDL, ignored
+    warm[13] = (100.0, 101.0, 97.0, 100.0)  # unswept swing low 97 (nearest the PDL)
+    warm[16] = (100.0, 101.0, 98.0, 100.0)  # unswept swing low 98 (nearer the close, not used)
     sig = setup3(bars(S3_BASIC, tail=S3_TAIL, warm=warm), "M5", lv(("pwh", 103), ("pdl", 95)), H1, D1)
     assert sig["signal_time"].tolist() == [T(30)]
     assert sig["target_owner"].iloc[0] == pytest.approx(97.0)
+
+
+def test_setup3_swept_swing_low_is_ignored_target_pdl():
+    warm = list(WARM)
+    warm[3] = (100.0, 101.0, 97.0, 100.0)  # swing low 97 ...
+    warm[8] = (100.0, 101.0, 96.5, 100.0)  # ... swept by swing low 96.5, itself swept by bar 13
+    warm[13] = (100.0, 101.0, 94.0, 100.0)  # swing low below the PDL
+    sig = setup3(bars(S3_BASIC, tail=S3_TAIL, warm=warm), "M5", lv(("pwh", 103), ("pdl", 95)), H1, D1)
+    assert sig["signal_time"].tolist() == [T(30)]
+    assert sig["target_owner"].iloc[0] == pytest.approx(95.0)
+
+
+def test_setup3_buy_target_is_unswept_swing_high_nearest_pdh():
+    warm = list(WARM)
+    warm[3] = (100.0, 104.0, 99.0, 100.0)  # swing high 104, swept by bar 8
+    warm[8] = (100.0, 105.5, 99.0, 100.0)  # above the PDH, ignored
+    warm[13] = (100.0, 103.0, 99.0, 100.0)  # unswept, nearest the PDH
+    warm[16] = (100.0, 102.0, 99.0, 100.0)  # unswept, nearer the close
+    rows = mirror(S3_BASIC)
+    sig = setup3(bars(rows, tail=mirror([S3_TAIL])[0], warm=warm), "M5", lv(("pwl", 97), ("pdh", 105)), H1, D1)
+    assert sig["signal_time"].tolist() == [T(30)]
+    assert sig["direction"].tolist() == [1]
+    assert sig["target_owner"].iloc[0] == pytest.approx(103.0)
 
 
 def test_setup3_no_owner_target_when_below_pdl():

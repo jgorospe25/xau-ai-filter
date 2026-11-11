@@ -163,9 +163,12 @@ def setup1(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame)
     return _finish(cands, entry, tf, "1")
 
 
-def _swing_arrays(entry: pd.DataFrame, tf: str, d: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _swing_arrays(
+    entry: pd.DataFrame, tf: str, d: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Sell-orientation swings: (hi_px, hi_bar) of the swing high confirmed AT each bar (NaN/-1 if none),
-    and (lo_px, lo_conf): every swing low price with the bar index at which it becomes known."""
+    and (lo_px, lo_conf, lo_bar): every swing low price, the bar index at which it becomes known,
+    and its own bar index, sorted by lo_conf."""
     t = entry["time"].to_numpy()
     close_t = (entry["time"] + TF_LEN[tf]).to_numpy()
     sw = swing_points(entry, tf)
@@ -177,7 +180,19 @@ def _swing_arrays(entry: pd.DataFrame, tf: str, d: int) -> tuple[np.ndarray, np.
     hi_px, hi_bar = np.full(n, np.nan), np.full(n, -1, dtype=int)
     hi_px[conf[hi]], hi_bar[conf[hi]] = px[hi], bar[hi]
     order = np.argsort(conf[~hi], kind="stable")
-    return hi_px, hi_bar, px[~hi][order], conf[~hi][order]
+    return hi_px, hi_bar, px[~hi][order], conf[~hi][order], bar[~hi][order]
+
+
+def _next_lower(low: np.ndarray) -> np.ndarray:
+    """Per bar k: index of the first later bar with low < low[k] (len(low) if none). Monotonic stack."""
+    n = len(low)
+    out = np.full(n, n, dtype=int)
+    stack: list[int] = []
+    for i in range(n):
+        while stack and low[i] < low[stack[-1]]:
+            out[stack.pop()] = i
+        stack.append(i)
+    return out
 
 
 def _last_known(px: np.ndarray, conf: np.ndarray, n: int) -> np.ndarray:
@@ -240,11 +255,14 @@ def _owner_targets(levels: pd.DataFrame, kind: str) -> tuple[np.ndarray, np.ndar
 
 def _owner_target(
     at: np.datetime64, cr: float, d: int, tgt: tuple[np.ndarray, np.ndarray, np.ndarray],
-    lo_px: np.ndarray, lo_conf: np.ndarray, r: int,
+    lo_px: np.ndarray, lo_conf: np.ndarray, lo_swept: np.ndarray, r: int,
 ) -> float:
-    """Sell orientation: nearer of PDL (valid at `at`) and the highest known swing low in (PDL, close).
+    """Sell orientation: the PDL valid at `at`, unless an UNSWEPT known swing low lies in (PDL, close);
+    then the lowest such swing low (the one just above the PDL).
 
-    `cr` = oriented close of the signal bar. NaN if no PDL or close is already at/below it.
+    Unswept = no bar after the swing bar, up to and including r, has low < its price
+    (`lo_swept` = index of that first lower bar). `cr` = oriented close of the signal bar.
+    NaN if no PDL or close <= PDL.
     """
     vf, vt, px = tgt
     q = int(np.searchsorted(vf, at, side="right")) - 1
@@ -253,16 +271,17 @@ def _owner_target(
     pdl = -d * px[q]
     if cr <= pdl:
         return np.nan
-    known = lo_px[: int(np.searchsorted(lo_conf, r, side="right"))]
-    between = known[(known > pdl) & (known < cr)]
-    return -d * (float(between.max()) if len(between) else pdl)
+    m = int(np.searchsorted(lo_conf, r, side="right"))
+    known = lo_px[:m]
+    ok = (known > pdl) & (known < cr) & (lo_swept[:m] > r)
+    return -d * (float(known[ok].min()) if ok.any() else pdl)
 
 
 def setup3(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame, d1: pd.DataFrame) -> pd.DataFrame:
     """Setup 3 signals (both directions): touch a zone, lower high, break the last swing low, retest.
 
-    target_owner = PDL (sell) / PDH (buy) from the `levels` rows valid at signal_time, or the nearer
-    known entry-TF swing low/high between the signal close and it. `d1` is accepted for the
+    target_owner = PDL (sell) / PDH (buy) from the `levels` rows valid at signal_time, or, if any,
+    the unswept known entry-TF swing low/high between it and the signal close nearest the PDL/PDH. `d1` is accepted for the
     interface; the PDL/PDH come from the level table (same D1 data, already no-lookahead).
     """
     del d1
@@ -276,7 +295,9 @@ def setup3(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame,
     cands: list[dict] = []
     for d, side, kind in ((-1, 1, "pdl"), (1, -1, "pdh")):
         _, h, c = _oriented(entry, d)
-        hi_px, hi_bar, lo_px, lo_conf = _swing_arrays(entry, tf, d)
+        low = entry["low"].to_numpy(dtype=float) if d == -1 else -entry["high"].to_numpy(dtype=float)
+        hi_px, hi_bar, lo_px, lo_conf, lo_bar = _swing_arrays(entry, tf, d)
+        lo_swept = _next_lower(low)[lo_bar]  # swing price == low of its bar
         last_lo = _last_known(lo_px, lo_conf, n)
         tgt = _owner_targets(levels, kind)
         for zi in np.flatnonzero(zones["side"].to_numpy() == side):
@@ -284,7 +305,7 @@ def setup3(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame,
             p = -d * float(z["price"])
             hits = _lower_high_break(h, c, tol, p, int(a[zi]), int(end[zi]), config.RETEST_BARS, hi_px, hi_bar, last_lo)
             for r, lh in hits:
-                owner = _owner_target(t[r], c[r], d, tgt, lo_px, lo_conf, r)
+                owner = _owner_target(t[r], c[r], d, tgt, lo_px, lo_conf, lo_swept, r)
                 cands.append(_cand(r, d, -d * lh, z, owner))
     return _finish(cands, entry, tf, "3")
 
