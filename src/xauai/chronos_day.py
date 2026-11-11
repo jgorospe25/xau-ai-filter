@@ -284,7 +284,7 @@ class ChronosBoltPredictor:
             ctx = self._torch.tensor(np.asarray(contexts[s:s + _BATCH], dtype=np.float32))
             hz = horizons[s:s + _BATCH]
             q, _ = self._pipe.predict_quantiles(
-                context=ctx, prediction_length=int(hz.max()), quantile_levels=[0.5]
+                ctx, prediction_length=int(hz.max()), quantile_levels=[0.5]
             )
             q = q.numpy()
             out[s:s + len(hz)] = q[np.arange(len(hz)), hz.astype(int) - 1, 0]
