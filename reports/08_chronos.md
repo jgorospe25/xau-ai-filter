@@ -172,7 +172,7 @@ re-run. The one-time look is recorded in `reports/08_test_done.json`.
 
 ## Results (development period 2022-05-16 .. 2025-10-23)
 
-Runtime 0.9 min. Versions tried here: **18** (pre-registered: 18), all eligible.
+Runtime 1.6 min. Versions tried here: **18** (pre-registered: 18), all eligible.
 
 ### In plain words
 
@@ -299,6 +299,23 @@ Days lost per version (simulator skips by reason, exact-zero forecasts, flat-fil
 - be_trail in practice trails 1R behind the best price from +1R (the trail distance equals the starting stop), so the stop rarely sits exactly at break-even.
 - Win rate is not the criterion; expectancy in R after costs and swap is.
 - **The test set has NOT been touched.** It is run once, with `--final`, only for a selected version.
+
+### Added after the results: always-buy comparison (does not change the verdict)
+
+| flat filter | year | days | Chronos buy share | Chronos hit rate | always-buy hit rate |
+|---|---|---|---|---|---|
+| off | 2022 | 141 | 54.6% | 57.4% | 51.8% |
+| off | 2023 | 257 | 60.7% | 51.0% | 56.0% |
+| off | 2024 | 259 | 69.9% | 47.9% | 57.9% |
+| off | 2025 | 210 | 76.7% | 59.0% | 62.4% |
+| off | all | 867 | 66.3% | 53.1% | 57.4% |
+| on | 2022 | 86 | 54.7% | 59.3% | 51.2% |
+| on | 2023 | 150 | 65.3% | 53.3% | 56.0% |
+| on | 2024 | 182 | 75.3% | 52.7% | 56.6% |
+| on | 2025 | 160 | 83.1% | 59.4% | 65.0% |
+| on | all | 578 | 71.8% | 55.7% | 58.0% |
+
+If always buying matches or beats Chronos, then Chronos's edge over a coin flip comes mostly from the rising market, not from reading the chart.
 
 
 ## Test set (Part C)
