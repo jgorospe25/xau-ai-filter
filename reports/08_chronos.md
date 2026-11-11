@@ -128,9 +128,9 @@ Some will pass by luck; the count is stated next to every result.
   drawdown (R), longest losing streak, trades per month, expectancy per year.
 - Cost as a share of the stop, and expectancy at total cost 0.50 and 0.75.
 - Skip counts by reason.
-- **Chronos direction hit rate:** the share of traded days where the trade's direction matched the sign of
-  (exit price minus fill), against 50%, with a confidence interval. The exit is wherever the trade actually
-  closed (stop, target or time exit).
+- **Chronos direction hit rate:** the share of traded days where the forecast direction matched the sign of the
+  raw price move from entry (10:00 PH) to the time exit (12:00 London), whatever the trade's stop or target did,
+  against 50%, with a confidence interval. A zero move counts as a miss.
 - The two rivals, as above.
 
 ### Selection rule (development period only)

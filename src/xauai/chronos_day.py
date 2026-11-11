@@ -419,6 +419,18 @@ def coin_flip_exps(
     return out
 
 
+def hit_rate(days: pd.DataFrame, m1: pd.DataFrame) -> float:
+    """Share of days whose direction matches sign(M1 open at exit_time - M1 open at entry_time): the forecast's
+    call on the raw move to the time exit, whatever the trade's stop or target did. Zero moves count as misses."""
+    if days.empty:
+        return float("nan")
+    tn = m1["time"].to_numpy()
+    o = m1["open"].to_numpy(float)
+    e = np.searchsorted(tn, days["entry_time"].to_numpy())
+    x = np.searchsorted(tn, days["exit_time"].to_numpy())
+    return float((np.sign(o[x] - o[e]) == days["direction"].to_numpy()).mean())
+
+
 def _breakeven_wr(r: pd.Series) -> float:
     w, l = r[r > 0], r[r < 0]
     if w.empty or l.empty:
@@ -440,8 +452,7 @@ def run_chronos_variant(
     out = research.flat_metrics(trades)
     out["name"] = v.name
     out["n_skipped"] = len(skipped)
-    hit = np.sign(trades["exit_price"] - trades["entry"]) == trades["direction"] if len(trades) else pd.Series(dtype=bool)
-    out["hit_rate"] = float(hit.mean()) if len(trades) else float("nan")
+    out["hit_rate"] = hit_rate(dd[dd["day"].isin(set(trades["day"]))], m1) if len(trades) else float("nan")
     out["breakeven_wr"] = _breakeven_wr(trades["r"]) if len(trades) else float("nan")
     out.update(beat_share=float("nan"), overnight_exp=float("nan"), overnight_n=0)
     if with_rivals and len(trades):

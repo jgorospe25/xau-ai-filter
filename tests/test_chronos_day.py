@@ -340,3 +340,16 @@ def test_preregistration_has_marker_and_no_results():
     assert text.count(cd.MARKER) == 1
     headings = [ln.lstrip("#").strip().lower() for ln in text.splitlines() if ln.startswith("#")]
     assert not any(h.startswith("results") for h in headings)
+
+
+def test_hit_rate_uses_move_to_time_exit() -> None:
+    times = pd.to_datetime(["2024-01-10 04:00", "2024-01-10 05:00", "2024-01-10 14:00",
+                            "2024-01-11 04:00", "2024-01-11 14:00"])
+    m1 = pd.DataFrame({"time": times, "open": [100.0, 90.0, 105.0, 100.0, 95.0]})
+    days = pd.DataFrame({
+        "entry_time": pd.to_datetime(["2024-01-10 04:00", "2024-01-11 04:00"]),
+        "exit_time": pd.to_datetime(["2024-01-10 14:00", "2024-01-11 14:00"]),
+        "direction": [1, 1],
+    })
+    # day 1: 100 -> 105 up (hit, even though price dipped to 90 first); day 2: 100 -> 95 down (miss)
+    assert cd.hit_rate(days, m1) == 0.5
