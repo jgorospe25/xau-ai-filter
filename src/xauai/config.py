@@ -130,3 +130,13 @@ TIME_FILTERS: dict[str, list[tuple[str, int, int]]] = {
     "killzone": [("America/New_York", 2, 5), ("America/New_York", 7, 10)],
     "owner": [("Asia/Manila", 8, 18)],
 }
+
+# Batch 3: zero-shot Chronos forecast as the direction of one H1 day trade (pre-registered)
+CHRONOS_DECISION: tuple[str, int] = ("Asia/Manila", 10)  # local zone, decision hour
+CHRONOS_EXIT: tuple[str, int] = ("Europe/London", 12)  # local zone, time-exit hour
+CHRONOS_CONTEXT: int = 512  # last H1 closes fed to the model
+CHRONOS_MODEL: str = "amazon/chronos-bolt-base"
+CHRONOS_STOP_MULTS: tuple[float, ...] = (1.5, 2.0, 3.0)  # stop = m x ATR14
+CHRONOS_EXITS: tuple[str, ...] = ("tp1.5", "tp2.0", "be_trail")
+CHRONOS_FLAT_ATR: float = 0.25  # flat filter: |forecast - last close| < this x ATR
+CHRONOS_BE_R: float = 1.0  # break-even trail arms at +1R
