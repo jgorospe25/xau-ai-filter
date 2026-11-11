@@ -14,7 +14,8 @@ import pandas as pd
 
 from xauai import config
 from xauai.indicators import atr
-from xauai.timeutil import utc_to_server
+from xauai.labels import CostParams, SwapParams, gap_after_mask, just_before_close, rollovers, simulate_trade
+from xauai.timeutil import TF_LEN, utc_to_server
 
 _UTC = ZoneInfo("UTC")
 _HOUR = pd.Timedelta(hours=1)
@@ -100,3 +101,142 @@ def day_table(h1: pd.DataFrame, m1: pd.DataFrame, start: str, end: str) -> tuple
             "prev_exit_price": prev_exit_price(m_t, m_close, day),
         })
     return pd.DataFrame(rows, columns=DAY_COLS), pd.DataFrame(skipped, columns=["day", "reason"])
+
+
+# --- M1 day-trade simulator ---------------------------------------------------------------------
+
+TRADE_COLS = [
+    "day", "signal_time", "entry_time", "exit_time", "direction", "atr", "sl_dist", "cost", "entry", "sl", "tp",
+    "exit_price", "exit_reason", "swap_r", "r_price", "r", "taken",
+]
+_EXIT_TP = {"tp1.5": 1.5, "tp2.0": 2.0}
+
+
+def simulate_trail_trade(
+    o: np.ndarray,
+    h: np.ndarray,
+    l: np.ndarray,
+    c: np.ndarray,
+    friday_close: np.ndarray,
+    gap_after: np.ndarray,
+    direction: int,
+    fill: float,
+    sl: float,
+    be_at: float,
+    trail_dist: float,
+    stop_open: int | None = None,
+) -> tuple[int, float, str, str]:
+    """Break-even + trailing-stop trade starting at bar 0 (fill = bar 0 open + cost). Returns as labels.simulate_trade.
+
+    The stop is `sl` until a bar's favourable extreme reaches `be_at`; from the next bar on it is
+    max_d(fill, best - d*trail_dist) with best through the previous closed bar, never loosened. Each bar
+    first checks the current stop (so a bar that also makes a new best is still a stop-out), then
+    updates best/stop for the next bar. Reasons: sl, be_sl, trail_sl, gap_sl, friday, session_end,
+    holiday, end_of_data.
+    """
+    d = direction
+    n = len(o)
+    stop = sl
+    best = fill
+    for j in range(n):
+        if j > 0:
+            if d * (o[j] - stop) <= 0:
+                return j, o[j], "gap_sl", "open"
+            if friday_close[j]:
+                return j, o[j], "friday", "open"
+            if j == stop_open:
+                return j, o[j], "session_end", "open"
+        if (l[j] <= stop) if d == 1 else (h[j] >= stop):
+            why = "sl" if stop == sl else "be_sl" if stop == fill else "trail_sl"
+            return j, stop, why, "intrabar"
+        ext = h[j] if d == 1 else l[j]
+        best = max(best, ext) if d == 1 else min(best, ext)
+        if d * (best - be_at) >= 0:
+            trail = best - d * trail_dist
+            stop = max(stop, fill, trail) if d == 1 else min(stop, fill, trail)
+        if gap_after[j]:
+            return j, c[j], "holiday", "close"
+    return n - 1, c[n - 1], "end_of_data", "close"
+
+
+def simulate_days(
+    days: pd.DataFrame,
+    m1: pd.DataFrame,
+    cost: CostParams,
+    swap: SwapParams,
+    m: float,
+    exit_style: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Simulate one M1 trade per day row (needs a `direction` column). Returns (trades, skipped).
+
+    exit_style: "tp1.5" / "tp2.0" (fixed TP at that multiple of the stop distance) or "be_trail".
+    Stop distance = m x the day's ATR from the fill; R is in units of that distance, net of swap.
+    """
+    if exit_style not in (*_EXIT_TP, "be_trail"):
+        raise ValueError(f"unknown exit_style {exit_style!r}")
+    m1 = m1.reset_index(drop=True)
+    t = m1["time"]
+    tn = t.to_numpy()
+    o, h, l, c = (m1[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    spread = m1["spread"].to_numpy(float)
+    n = len(m1)
+    friday_close = ((t.dt.day_of_week == 4) & (t.dt.hour >= config.FRIDAY_EXIT_HOUR)).to_numpy()
+    gap_after = gap_after_mask(t)
+    friday_idx, gap_idx = np.flatnonzero(friday_close), np.flatnonzero(gap_after)
+    close_offset = just_before_close(TF_LEN["M1"])
+
+    trades: list[dict] = []
+    skipped: list[dict] = []
+    for _, row in days.iterrows():
+        d = int(row["direction"])
+        et, xt = row["entry_time"], row["exit_time"]
+        e = int(np.searchsorted(tn, et.to_datetime64()))
+        x = int(np.searchsorted(tn, xt.to_datetime64()))
+        reason = (
+            "no_entry_bar" if e >= n or tn[e] != et.to_datetime64()
+            else "stale_after_gap" if e > 0 and gap_after[e - 1]
+            else "entry_after_friday_close" if friday_close[e]
+            else "no_exit_after_entry" if x <= e or x >= n
+            else None
+        )
+        dist = m * float(row["atr"])
+        if reason is None and not dist > 0:
+            reason = "sl_behind_fill"
+        if reason:
+            skipped.append({"day": row["day"], "reason": reason})
+            continue
+
+        k = cost.per_trade(spread[e])
+        fill = o[e] + d * k
+        sl = fill - d * dist
+        bound = min(n - 1, x)
+        f = np.searchsorted(friday_idx, e, side="right")
+        if f < len(friday_idx):
+            bound = min(bound, friday_idx[f])
+        g = np.searchsorted(gap_idx, e)
+        if g < len(gap_idx):
+            bound = min(bound, gap_idx[g])
+        s = slice(e, bound + 1)
+        tp = np.nan
+        if exit_style == "be_trail":
+            j, px, why, when = simulate_trail_trade(
+                o[s], h[s], l[s], c[s], friday_close[s], gap_after[s], d, fill, sl,
+                fill + d * config.CHRONOS_BE_R * dist, dist, x - e,
+            )
+        else:
+            tp = fill + d * _EXIT_TP[exit_style] * dist
+            j, px, why, when = simulate_trade(
+                o[s], h[s], l[s], c[s], friday_close[s], gap_after[s], 0, d, fill, sl, tp, None, x - e
+            )
+        j += e
+        exit_time = t[j] if when == "open" else t[j] + close_offset
+        _, weighted = rollovers(t[e], exit_time, swap.triple_weekday)
+        swap_px = weighted * swap.points_per_night(d, float(row["last_close"])) * swap.point
+        r_price = d * (px - fill) / dist
+        trades.append({
+            "day": row["day"], "signal_time": row["decision_time"], "entry_time": t[e], "exit_time": exit_time,
+            "direction": d, "atr": float(row["atr"]), "sl_dist": dist, "cost": k, "entry": fill, "sl": sl,
+            "tp": tp, "exit_price": px, "exit_reason": why, "swap_r": swap_px / dist, "r_price": r_price,
+            "r": r_price + swap_px / dist, "taken": True,
+        })
+    return pd.DataFrame(trades, columns=TRADE_COLS), pd.DataFrame(skipped, columns=["day", "reason"])
