@@ -138,12 +138,17 @@ def in_windows(times: pd.Series, windows: pd.DataFrame) -> np.ndarray:
 
 
 def time_filter_mask(times: pd.Series, mode: str) -> np.ndarray:
-    """Bool mask of times inside the config.TIME_FILTERS[mode] windows; all True for "none"."""
+    """Bool mask of times inside the config.TIME_FILTERS[mode] windows; all True for "none".
+    NaT is always False; empty input gives an empty mask."""
     spec = config.TIME_FILTERS[mode]
-    if not spec:
-        return np.ones(len(times), dtype=bool)
-    t = pd.to_datetime(times)
-    lo = (t.min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    hi = (t.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    t = pd.Series(pd.to_datetime(pd.Series(times)).to_numpy())
+    ok = t.notna().to_numpy()
+    if not spec or not ok.any():
+        return ok
+    v = t[ok]
+    lo = (v.min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    hi = (v.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     w = pd.concat([local_windows(lo, hi, z, a, b) for z, a, b in spec], ignore_index=True)
-    return in_windows(t, w)
+    out = np.zeros(len(t), dtype=bool)
+    out[ok] = in_windows(v, w)
+    return out

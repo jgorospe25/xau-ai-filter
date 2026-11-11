@@ -227,11 +227,14 @@ def null_candidates(inp: Inputs, tf: str) -> pd.DataFrame:
     return out
 
 
-def null_draws(taken: pd.DataFrame, cands: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+def null_draws(
+    taken: pd.DataFrame, cands: pd.DataFrame, rng: np.random.Generator, extra: tuple[str, ...] = ()
+) -> pd.DataFrame:
     """One random run. For every taken trade: a random candidate bar with the same session label, and the same
     direction (so session counts, direction mix and their pairing are exact). Each random trade gets an
     (SL distance in price, TP distance in R) pair drawn jointly, with replacement, from the taken trades.
-    Within a session, bars are drawn without replacement unless there are too few."""
+    Within a session, bars are drawn without replacement unless there are too few.
+    `extra` columns of `taken` are returned at the same drawn trade (no extra random numbers are used)."""
     sess = taken["session"].fillna("none").astype(str).to_numpy()
     dirs = taken["direction"].to_numpy(int)
     sl = taken["sl_dist"].to_numpy(float)
@@ -244,9 +247,12 @@ def null_draws(taken: pd.DataFrame, cands: pd.DataFrame, rng: np.random.Generato
         pool = pools.get(s, all_times)
         entry[idx] = rng.choice(pool, size=len(idx), replace=len(idx) > len(pool))
     pick = rng.integers(0, len(taken), size=len(taken))
-    return pd.DataFrame(
+    out = pd.DataFrame(
         {"entry_time": entry, "session": sess, "direction": dirs, "sl_dist": sl[pick], "tp_r": tp_r[pick]}
     )
+    for col in extra:
+        out[col] = taken[col].to_numpy()[pick]
+    return out
 
 
 def _variant_offset(v: Variant) -> int:
@@ -256,16 +262,17 @@ def _variant_offset(v: Variant) -> int:
 
 def null_distribution(
     v: Variant, trades: pd.DataFrame, inp: Inputs, repeats: int = config.NULL_REPEATS, seed: int = NULL_SEED,
-    total_cost: float = 0.35,
+    total_cost: float = 0.35, cands: pd.DataFrame | None = None, seed_offset: int | None = None,
 ) -> np.ndarray:
     """Expectancy (one position at a time) of each random run; rng seed = seed + index in variant_grid.
     All runs go through simulate_signals with the variant's own session_exit; fixed-RR variants keep their
-    TP mode, target variants use each drawn trade's realised TP distance in R. SL = fill -/+ drawn distance."""
+    TP mode, target variants use each drawn trade's realised TP distance in R. SL = fill -/+ drawn distance.
+    `cands` overrides null_candidates(inp, v.entry_tf) and `seed_offset` the variant_grid index (None = default)."""
     taken = trades[trades["taken"].astype(bool)].reset_index(drop=True)
     if taken.empty:
         return np.full(repeats, np.nan)
-    rng = np.random.default_rng(seed + _variant_offset(v))
-    cands = null_candidates(inp, v.entry_tf)
+    rng = np.random.default_rng(seed + (_variant_offset(v) if seed_offset is None else seed_offset))
+    cands = null_candidates(inp, v.entry_tf) if cands is None else cands
     m1 = inp.bars["M1"]
     tn = m1["time"].to_numpy()
     o, spread = m1["open"].to_numpy(float), m1["spread"].to_numpy(float)

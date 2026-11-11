@@ -97,3 +97,15 @@ def test_time_filter_none_all_true():
     assert time_filter_mask(t, "none").all()
     m = time_filter_mask(t, "owner")
     assert m.dtype == bool and 0 < m.sum() < len(t)
+
+
+def test_time_filter_empty_and_nat():
+    empty = pd.Series(pd.to_datetime([]))
+    for mode in ("none", "killzone", "owner"):
+        m = time_filter_mask(empty, mode)
+        assert m.dtype == bool and len(m) == 0
+    # 2025-01-06 (NY winter): kill zone 02-05 NY = 09-12 server
+    t = pd.Series(pd.to_datetime(["2025-01-06 10:00", None, "2025-01-06 13:00"]))
+    assert list(time_filter_mask(t, "killzone")) == [True, False, False]
+    assert list(time_filter_mask(t, "none")) == [True, False, True]
+    assert not time_filter_mask(pd.Series([pd.NaT, pd.NaT]), "owner").any()
