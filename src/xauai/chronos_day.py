@@ -342,3 +342,137 @@ def load_or_build_forecasts(
     path.parent.mkdir(parents=True, exist_ok=True)
     fc.to_parquet(path, index=False)
     return fc
+
+
+# ---- Directions, rivals, grid, selection -------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+from itertools import product  # noqa: E402
+
+_FLAT_ATR = 0.25
+_STOP_MULTS = (1.5, 2.0, 3.0)
+_EXITS = ("tp1.5", "tp2.0", "be_trail")
+
+
+@dataclass(frozen=True)
+class ChronosVariant:
+    m: float
+    exit_style: str
+    flat: bool
+
+    @property
+    def name(self) -> str:
+        return f"m{self.m:.1f}|{self.exit_style}|{'flat' if self.flat else 'all'}"
+
+
+def chronos_grid() -> list[ChronosVariant]:
+    """18 versions in the order m -> exit -> flat (off before on)."""
+    return [ChronosVariant(m, e, f) for m, e, f in product(_STOP_MULTS, _EXITS, (False, True))]
+
+
+def chronos_directions(days: pd.DataFrame, fc: pd.DataFrame, flat: bool) -> pd.DataFrame:
+    """days joined to the forecast on `day`, plus direction = sign(median - last_close).
+
+    A zero sign is dropped; with `flat`, |median - last_close| < 0.25 x atr is dropped too.
+    """
+    f = fc[["day", "median"]]
+    d = days.merge(f, on="day", how="inner")
+    diff = d["median"].to_numpy(float) - d["last_close"].to_numpy(float)
+    keep = diff != 0
+    if flat:
+        keep &= np.abs(diff) >= _FLAT_ATR * d["atr"].to_numpy(float)
+    d = d.loc[keep].copy()
+    d["direction"] = np.sign(diff[keep]).astype(int)
+    return d.reset_index(drop=True)
+
+
+def overnight_directions(days: pd.DataFrame) -> pd.Series:
+    """sign(last_close - prev_exit_price); a zero or NaN move is left out (no trade)."""
+    s = np.sign(days["last_close"].astype(float) - days["prev_exit_price"].astype(float))
+    return s[s.notna() & (s != 0)].astype(int)
+
+
+def coin_flip_exps(
+    days_traded: pd.DataFrame, m1: pd.DataFrame, cost: CostParams, swap: SwapParams,
+    v: ChronosVariant, repeats: int, seed: int,
+) -> np.ndarray:
+    """Expectancy of each of `repeats` runs with a random +-1 direction per day (same m and exit).
+
+    Both directions are simulated once per day; a run just picks one per day, which is the same as
+    simulating that run's random directions.
+    """
+    rng = np.random.default_rng(seed)
+    r = {}
+    for d in (1, -1):
+        tr, _ = simulate_days(days_traded.assign(direction=d), m1, cost, swap, v.m, v.exit_style)
+        r[d] = tr.set_index("day")["r"]
+    both = pd.concat([r[1].rename("up"), r[-1].rename("down")], axis=1).dropna()
+    if both.empty:
+        return np.full(repeats, np.nan)
+    up, down = both["up"].to_numpy(float), both["down"].to_numpy(float)
+    out = np.empty(repeats)
+    for i in range(repeats):
+        pick = rng.integers(0, 2, size=len(up)).astype(bool)
+        out[i] = float(np.where(pick, up, down).mean())
+    return out
+
+
+def _breakeven_wr(r: pd.Series) -> float:
+    w, l = r[r > 0], r[r < 0]
+    if w.empty or l.empty:
+        return float("nan")
+    al = abs(float(l.mean()))
+    return al / (float(w.mean()) + al)
+
+
+def run_chronos_variant(
+    v: ChronosVariant, days: pd.DataFrame, fc: pd.DataFrame, m1: pd.DataFrame,
+    cost: CostParams, swap: SwapParams, with_rivals: bool = True,
+    repeats: int = config.NULL_REPEATS, seed: int | None = None,
+) -> dict:
+    """flat_metrics of the variant's trades plus rivals (beat_share, overnight_exp/n), hit_rate, breakeven_wr, trades."""
+    if seed is None:
+        seed = research.NULL_SEED + 3000 + chronos_grid().index(v)
+    dd = chronos_directions(days, fc, v.flat)
+    trades, skipped = simulate_days(dd, m1, cost, swap, v.m, v.exit_style)
+    out = research.flat_metrics(trades)
+    out["name"] = v.name
+    out["n_skipped"] = len(skipped)
+    hit = np.sign(trades["exit_price"] - trades["entry"]) == trades["direction"] if len(trades) else pd.Series(dtype=bool)
+    out["hit_rate"] = float(hit.mean()) if len(trades) else float("nan")
+    out["breakeven_wr"] = _breakeven_wr(trades["r"]) if len(trades) else float("nan")
+    out.update(beat_share=float("nan"), overnight_exp=float("nan"), overnight_n=0)
+    if with_rivals and len(trades):
+        traded = dd[dd["day"].isin(set(trades["day"]))]
+        exps = coin_flip_exps(traded, m1, cost, swap, v, repeats, seed)
+        out["beat_share"] = research.beat_share(out["expectancy_R"], exps)
+        od = overnight_directions(traded)
+        if len(od):
+            ov, _ = simulate_days(traded.loc[od.index].assign(direction=od), m1, cost, swap, v.m, v.exit_style)
+            out["overnight_exp"] = float(ov["r"].mean()) if len(ov) else float("nan")
+            out["overnight_n"] = len(ov)
+    out["trades"] = trades
+    return out
+
+
+def chronos_select(table: pd.DataFrame) -> pd.DataFrame:
+    """Adds `fail` (first failed of n / years / null / overnight; "" = passes) and `selected`
+    (True only for the passing row with the highest expectancy_R)."""
+    out = table.copy()
+    years_ok = np.ones(len(out), dtype=bool)
+    for y in research.SELECT_YEARS:
+        years_ok &= (out[f"exp_{y}"].astype(float) > 0).to_numpy()
+    exp = out["expectancy_R"].astype(float)
+    ov = out["overnight_exp"].astype(float)
+    conds = [
+        (out["n"] < config.SELECT_MIN_N).to_numpy(),
+        ~years_ok,
+        ~(out["beat_share"].astype(float) >= config.NULL_BEAT).to_numpy(),
+        ~(exp > ov).to_numpy(),  # NaN overnight fails
+    ]
+    out["fail"] = np.select(conds, ["n", "years", "null", "overnight"], default="")
+    out["selected"] = False
+    ok = out.index[out["fail"] == ""]
+    if len(ok):
+        out.loc[exp.loc[ok].idxmax(), "selected"] = True
+    return out

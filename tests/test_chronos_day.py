@@ -272,3 +272,64 @@ def test_forecast_cache_reused_and_invalidated(tmp_path):
 def test_unit_tests_do_not_import_chronos():
     assert "chronos" not in sys.modules and "torch" not in sys.modules
     assert hasattr(cd, "ChronosBoltPredictor")
+
+
+# --- directions, rivals, grid, selection (Task 4) -------------------------------------------------
+
+
+def _dir_inputs(delta: float, atr: float = 2.0):
+    days = pd.DataFrame({
+        "day": [pd.Timestamp("2024-01-10").date()], "last_close": [100.0], "atr": [atr],
+        "prev_exit_price": [99.0],
+    })
+    fc = pd.DataFrame({"day": days["day"], "median": [100.0 + delta]})
+    return days, fc
+
+
+def test_grid_is_18_named():
+    g = cd.chronos_grid()
+    names = [v.name for v in g]
+    assert len(g) == 18 and len(set(names)) == 18
+    assert "m2.0|tp2.0|flat" in names and "m1.5|be_trail|all" in names
+    assert names[0] == "m1.5|tp1.5|all" and names[1] == "m1.5|tp1.5|flat"
+
+
+def test_flat_filter_drops_small_moves():
+    days, fc = _dir_inputs(0.4, atr=2.0)  # 0.4 = 0.2 * atr
+    assert len(cd.chronos_directions(days, fc, flat=True)) == 0
+    kept = cd.chronos_directions(days, fc, flat=False)
+    assert len(kept) == 1 and kept["direction"].iloc[0] == 1
+    days, fc = _dir_inputs(0.0)
+    assert len(cd.chronos_directions(days, fc, flat=False)) == 0
+    days, fc = _dir_inputs(-3.0)
+    assert cd.chronos_directions(days, fc, flat=True)["direction"].iloc[0] == -1
+
+
+def test_overnight_direction_sign():
+    days = pd.DataFrame({"last_close": [101.0, 99.0, 100.0, 100.0], "prev_exit_price": [100.0, 100.0, 100.0, np.nan]})
+    s = cd.overnight_directions(days)
+    assert s.dropna().tolist() == [1, -1] and s.index.tolist() == [0, 1]
+
+
+def test_coin_flips_seeded_per_variant():
+    m1 = _m1(_flat(3) + [(100, 103.5, 99.9, 103)] + _flat(3, 103))
+    days = _days(m1, 1, 6)
+    v = cd.ChronosVariant(1.0, "tp1.5", False)
+    big = pd.concat([days.assign(day=pd.Timestamp("2024-01-10").date())] * 1)
+    a = cd.coin_flip_exps(big, m1, _ZERO, _NOSWAP, v, 30, 11)
+    b = cd.coin_flip_exps(big, m1, _ZERO, _NOSWAP, v, 30, 11)
+    c = cd.coin_flip_exps(big, m1, _ZERO, _NOSWAP, v, 30, 12)
+    assert len(a) == 30 and np.array_equal(a, b, equal_nan=True)
+    assert not np.array_equal(a, c, equal_nan=True)
+
+
+def test_select_order_and_best_only():
+    base = dict(n=150, exp_2022=0.1, exp_2023=0.1, exp_2024=0.1, exp_2025=0.1, beat_share=0.99, overnight_exp=0.0)
+    t = pd.DataFrame([
+        {**base, "name": "A", "exp_2024": -0.1, "expectancy_R": 0.5},
+        {**base, "name": "B", "expectancy_R": 0.2},
+        {**base, "name": "C", "expectancy_R": 0.3, "overnight_exp": 0.4},
+    ])
+    out = cd.chronos_select(t)
+    assert out["fail"].tolist() == ["years", "", "overnight"]
+    assert out["selected"].tolist() == [False, True, False]
