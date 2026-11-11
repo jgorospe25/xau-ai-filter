@@ -31,6 +31,16 @@ HOUR = pd.Timedelta(hours=1)
 JUST_BEFORE_CLOSE = HOUR - pd.Timedelta(seconds=1)  # intrabar/close exits happen before the next hour
 
 
+def just_before_close(bar: pd.Timedelta) -> pd.Timedelta:
+    """Exit-time offset for intrabar/close exits: just before the next bar of this length opens."""
+    return bar - pd.Timedelta(seconds=1)
+
+
+def gap_after_mask(times: pd.Series, hours: float = config.HOLIDAY_GAP_HOURS) -> np.ndarray:
+    """True where the wall-clock step to the next bar exceeds `hours` (the last bar is False)."""
+    return (times.diff().shift(-1) > pd.Timedelta(hours=hours)).to_numpy()
+
+
 @dataclass(frozen=True)
 class CostParams:
     spread_floor: float = config.SPREAD_FLOOR
@@ -95,9 +105,14 @@ def simulate_trade(
     entry: float,
     sl: float,
     tp: float,
-    timeout: int,
+    timeout: int | None,
+    stop_open: int | None = None,
 ) -> tuple[int, float, str, str]:
-    """Return (exit bar, exit price, reason, when) with when in {"open", "intrabar", "close"}."""
+    """Return (exit bar, exit price, reason, when) with when in {"open", "intrabar", "close"}.
+
+    timeout=None means no bar-count timeout. stop_open = index of the bar at whose open the trade
+    is closed ("session_end"), checked after the Friday check.
+    """
     d = direction
     n = len(o)
     for j in range(e, n):
@@ -108,6 +123,8 @@ def simulate_trade(
                 return j, o[j], "gap_tp", "open"
             if friday_close[j]:
                 return j, o[j], "friday", "open"
+            if j == stop_open:
+                return j, o[j], "session_end", "open"
         hit_sl = l[j] <= sl if d == 1 else h[j] >= sl
         hit_tp = h[j] >= tp if d == 1 else l[j] <= tp
         if hit_sl:
@@ -116,7 +133,7 @@ def simulate_trade(
             return j, tp, "tp", "intrabar"
         if gap_after[j]:
             return j, c[j], "holiday", "close"
-        if j - e + 1 >= timeout:
+        if timeout is not None and j - e + 1 >= timeout:
             return j, c[j], "timeout", "close"
     return n - 1, c[n - 1], "end_of_data", "close"
 
@@ -130,6 +147,7 @@ def label_signals(
     timeout: int = config.TIMEOUT_BARS,
     friday_hour: int = config.FRIDAY_EXIT_HOUR,
     holiday_gap_bars: int = config.HOLIDAY_GAP_BARS,
+    bar: pd.Timedelta = HOUR,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Label every signal in df (columns: time, open, high, low, close, spread, atr, signal).
 
@@ -140,8 +158,8 @@ def label_signals(
     o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
     spread, atr_v, sig = df["spread"].to_numpy(float), df["atr"].to_numpy(float), df["signal"].to_numpy()
     friday_close = ((t.dt.day_of_week == 4) & (t.dt.hour >= friday_hour)).to_numpy()
-    step = t.diff().shift(-1)  # time to the next bar
-    gap_after = (step > (holiday_gap_bars + 1) * HOUR).to_numpy()
+    gap_after = gap_after_mask(t, (holiday_gap_bars + 1) * bar / HOUR)
+    close_offset = just_before_close(bar)
 
     trades, skipped = [], []
     for s in np.flatnonzero(sig != 0):
@@ -163,7 +181,7 @@ def label_signals(
         sl, tp = entry - d * dist, entry + d * rr * dist
         j, px, why, when = simulate_trade(o, h, l, c, friday_close, gap_after, e, d, entry, sl, tp, timeout)
 
-        exit_time = t[j] if when == "open" else t[j] + JUST_BEFORE_CLOSE
+        exit_time = t[j] if when == "open" else t[j] + close_offset
         nights, weighted = rollovers(t[e], exit_time, swap.triple_weekday)
         swap_px = weighted * swap.points_per_night(d, c[s]) * swap.point
         r_price = d * (px - entry) / dist
