@@ -8,6 +8,7 @@ naive datetimes (no timezone conversion). The still-forming last bar is dropped.
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from xauai import config
+from xauai.timeutil import TF_LEN
 
 KEEP_COLS = ["time", "open", "high", "low", "close", "tick_volume", "spread"]
 SYMBOL_FIELDS = [
@@ -275,5 +277,44 @@ def main() -> None:
     print(f"Wrote {report_path}")
 
 
+RESEARCH_TFS = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
+
+
+def export_research(tfs: tuple[str, ...] = RESEARCH_TFS) -> dict[str, int]:
+    """Export closed bars for each timeframe to data/raw/research/ (one parquet per TF).
+
+    Also writes the symbol snapshot to data/raw/research/symbol_info.json. Phase 3 files
+    (data/raw/xauusd_h1.parquet, xauusd_d1.parquet, symbol_info.json) are never touched.
+    """
+    counts: dict[str, int] = {}
+    connect(config.SYMBOL)
+    try:
+        tick = mt5.symbol_info_tick(config.SYMBOL)
+        server_now = pd.to_datetime(tick.time, unit="s") if tick else None
+        config.RESEARCH_RAW_DIR.mkdir(parents=True, exist_ok=True)
+        for tf in tfs:
+            df = fetch_rates(config.SYMBOL, getattr(mt5, f"TIMEFRAME_{tf}"))
+            now = server_now if server_now is not None else df["time"].iloc[-1] + TF_LEN[tf]
+            df = drop_forming_bar(df, now, TF_LEN[tf]).reset_index(drop=True)
+            df.to_parquet(config.research_path(tf), index=False)
+            counts[tf] = len(df)
+            print(f"{tf}: {len(df):,} bars {df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
+        snap = symbol_snapshot(config.SYMBOL)
+    finally:
+        mt5.shutdown()
+    config.RESEARCH_SYMBOL_INFO_PATH.write_text(json.dumps(snap, indent=2, default=str), encoding="utf-8")
+    return counts
+
+
+def cli(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Export XAUUSD bars from a running MT5 terminal.")
+    parser.add_argument("--research", action="store_true", help="export M1..D1 to data/raw/research/")
+    args = parser.parse_args(argv)
+    if args.research:
+        export_research()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    cli()

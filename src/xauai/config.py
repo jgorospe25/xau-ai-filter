@@ -78,6 +78,7 @@ TEST_END: str = "2026-10-23"
 
 # --- Research (project 1): session-liquidity setups ---------------------------
 RESEARCH_RAW_DIR: Path = RAW_DIR / "research"
+RESEARCH_SYMBOL_INFO_PATH: Path = RESEARCH_RAW_DIR / "symbol_info.json"
 
 
 def research_path(tf: str) -> Path:
