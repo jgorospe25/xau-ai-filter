@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -473,6 +475,46 @@ def test_ict_main_smoke_writes_only_smoke_dir(tmp_path, monkeypatch) -> None:
     assert set(table["name"]) == set(research_ict.SMOKE_VARIANTS)
 
 
-def test_ict_main_final_is_task8() -> None:
-    with pytest.raises(SystemExit, match="Task 8"):
+def _ict_final_env(tmp_path, monkeypatch, selected: list[str]):
+    rdir, ddir = tmp_path / "reports", tmp_path / "data_research"
+    rdir.mkdir()
+    ddir.mkdir()
+    monkeypatch.setattr(config, "REPORTS_DIR", rdir)
+    monkeypatch.setattr(research_ict, "RESEARCH_DATA_DIR", ddir)
+    (ddir / "07_selected.json").write_text(json.dumps({"selected": selected}), encoding="utf-8")
+    (rdir / research_ict.REPORT_NAME).write_bytes(("pre\n" + research_ict.MARKER + "\nbody\n").encode())
+    monkeypatch.setattr(research, "load_inputs", lambda: (_ for _ in ()).throw(AssertionError("loaded")))
+    return rdir
+
+
+def test_ict_final_refuses_second_run(tmp_path, monkeypatch) -> None:
+    rdir = _ict_final_env(tmp_path, monkeypatch, ["m1|M5|rr2.0|nodir|none"])
+    (rdir / research_ict.MARKER_NAME).write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit):
         research_ict.main(["--final"])
+
+
+def test_ict_final_empty_selection_does_not_load_test_data(tmp_path, monkeypatch) -> None:
+    rdir = _ict_final_env(tmp_path, monkeypatch, [])
+    research_ict.main(["--final"])
+    assert not (rdir / research_ict.MARKER_NAME).exists()
+    text = (rdir / research_ict.REPORT_NAME).read_bytes().decode()
+    assert research.TEST_HEADING in text and research_ict.TEST_NOT_RUN_TEXT in text
+    assert "\r" not in text and text.startswith("pre\n" + research_ict.MARKER)
+    research_ict.main(["--final"])  # idempotent
+    assert (rdir / research_ict.REPORT_NAME).read_bytes().decode().count(research.TEST_HEADING) == 1
+
+
+def test_ict_final_writes_marker_before_computing(tmp_path, monkeypatch) -> None:
+    rdir = _ict_final_env(tmp_path, monkeypatch, ["m1|M5|rr2.0|nodir|none"])
+    with pytest.raises(AssertionError, match="loaded"):
+        research_ict.main(["--final"])
+    assert json.loads((rdir / research_ict.MARKER_NAME).read_text())["selected"] == ["m1|M5|rr2.0|nodir|none"]
+
+
+def test_run_ict_test_set_columns(monkeypatch) -> None:
+    monkeypatch.setattr(config, "TEST_START", DAY)
+    monkeypatch.setattr(config, "TEST_END", DAY)
+    res = research_ict.run_ict_test_set(pd.DataFrame({"name": ["m5|M5|rr2.0|nodir|none"]}), _smoke_inputs())
+    assert list(res.columns) == ["name", "n", "expectancy_R", "ci95_low", "ci95_high", "verdict"]
+    assert res.loc[0, "verdict"] in ("PASS", "FAIL")

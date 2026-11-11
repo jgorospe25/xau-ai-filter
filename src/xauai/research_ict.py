@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from xauai import config, research
+from xauai.backtest import bootstrap_ci
 from xauai.indicators import atr
 from xauai.labels import CostParams, SwapParams
 from xauai.research import (
@@ -544,15 +545,73 @@ def _ict_charts(by_name: dict[str, VariantResult], table: pd.DataFrame, best: di
     return names
 
 
-def ict_test_section_md(selected: list[str]) -> list[str]:
-    """Lines of the Test set section before Task 8 runs it: not-run text, or pending with the selected names."""
-    if not selected:
+def ict_test_section_md(selected: list[str], results: pd.DataFrame | None = None) -> list[str]:
+    """Lines of the Test set section: not-run text, pending text, or (with `results`) the one-time results table."""
+    if results is not None:
+        rows = [{
+            "variant": r["name"], "n": int(r["n"]), "exp R": _f(r["expectancy_R"]),
+            "95% CI": _ci(r["ci95_low"], r["ci95_high"]), "verdict": r["verdict"],
+        } for _, r in results.iterrows()]
+        body = [_md(rows), "",
+                f"PASS = expectancy >= {config.TEST_MIN_EXP:+.2f}R, n >= {config.TEST_MIN_N} and CI low > "
+                f"{config.TEST_MIN_CI_LO:+.2f}R. Bootstrap 95% CI, 10,000 resamples. Run once.", ""]
+    elif not selected:
         body = [TEST_NOT_RUN_TEXT, ""]
     elif (config.REPORTS_DIR / MARKER_NAME).exists():
         body = [f"Run once; see reports/{MARKER_NAME}.", ""]
     else:
         body = ["Not yet run. Selected: " + ", ".join(f"`{n}`" for n in selected) + ".", ""]
     return ["", research.TEST_HEADING, ""] + body
+
+
+def run_ict_test_set(selected: pd.DataFrame, inp: Inputs) -> pd.DataFrame:
+    """Test period TEST_START..TEST_END for each selected variant (one position / order at a time), net of costs.
+    PASS needs expectancy >= TEST_MIN_EXP, n >= TEST_MIN_N and bootstrap CI low > TEST_MIN_CI_LO."""
+    by_name = {v.name: v for v in ict_grid()}
+    rows = []
+    for name in selected["name"]:
+        tr, _ = run_ict_detail(by_name[name], inp, config.TEST_START, config.TEST_END)
+        r = tr.loc[tr["taken"].astype(bool), "r"].to_numpy(float)
+        lo, hi = bootstrap_ci(r)
+        exp = float(r.mean()) if len(r) else float("nan")
+        ok = len(r) >= config.TEST_MIN_N and exp >= config.TEST_MIN_EXP and lo > config.TEST_MIN_CI_LO
+        rows.append({"name": name, "n": len(r), "expectancy_R": exp, "ci95_low": lo, "ci95_high": hi,
+                     "verdict": "PASS" if ok else "FAIL"})
+    return pd.DataFrame(rows, columns=["name", "n", "expectancy_R", "ci95_low", "ci95_high", "verdict"])
+
+
+def _replace_test_section(path, lines: list[str]) -> None:
+    """research.replace_test_section, but line endings are left untouched (the report is LF on Windows)."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    new = "\n".join(lines).strip("\n") + "\n"
+    i = text.find(research.TEST_HEADING)
+    if i < 0:
+        text = text.rstrip("\n") + "\n\n" + new
+    else:
+        j = text.find("\n## ", i + 1)
+        text = text[:i] + new + (text[j:] if j >= 0 else "")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def final_main() -> None:
+    marker = config.REPORTS_DIR / MARKER_NAME
+    if marker.exists():
+        raise SystemExit(f"{marker} exists: the test set was already run once and must not be run again.")
+    sel = json.loads((RESEARCH_DATA_DIR / "07_selected.json").read_text(encoding="utf-8"))["selected"]
+    report = config.REPORTS_DIR / REPORT_NAME
+    if not sel:
+        _replace_test_section(report, ict_test_section_md([]))
+        print(TEST_NOT_RUN_TEXT)
+        return
+    marker.write_text(
+        json.dumps({"selected": sel, "timestamp": datetime.now().isoformat(timespec="seconds")}, indent=2),
+        encoding="utf-8",
+    )
+    res = run_ict_test_set(pd.DataFrame({"name": sel}), research.load_inputs())
+    _replace_test_section(report, ict_test_section_md(sel, res))
+    print(res.to_string(index=False))
 
 
 def build_ict_results(
@@ -743,10 +802,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--smoke", action="store_true",
                     help=f"run {len(SMOKE_VARIANTS)} variants with {SMOKE_REPEATS} null repeats; writes only to "
                          f"data/research/{SMOKE_DIR}/")
-    ap.add_argument("--final", action="store_true", help="test period, run once (Task 8; not implemented yet)")
+    ap.add_argument("--final", action="store_true", help="test period for the selected variants, run once")
     args = ap.parse_args(argv)
     if args.final:
-        raise SystemExit("--final (one-time test period) is Task 8 and is not implemented yet")
+        final_main()
+        return
     t0 = time.time()
     smoke = args.smoke
     out_dir = RESEARCH_DATA_DIR / SMOKE_DIR if smoke else config.REPORTS_DIR
