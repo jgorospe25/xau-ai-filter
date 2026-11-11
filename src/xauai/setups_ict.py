@@ -67,13 +67,13 @@ def _model1_zone(
     """Model 1 at one zone above `p` (sell orientation), failed breaks in [a, end). Oriented values."""
     n = len(c)
     with np.errstate(invalid="ignore"):
-        fb = (o < p) & (h >= p - tol) & (c < p)
+        fb = (o[a:end] < p) & (h[a:end] >= p - tol[a:end]) & (c[a:end] < p) & ~np.isnan(swing[a:end])
+    cand = a + np.flatnonzero(fb)  # failed breaks with a known trade-side swing
     out: list[dict] = []
-    j = a
-    while j < end:
-        if not fb[j] or np.isnan(swing[j]):
-            j += 1
-            continue
+    q0 = 0
+    while q0 < len(cand):
+        j = int(cand[q0])
+        q0 += 1
         s, tip = swing[j], h[j]
         seen = bool(disp[j])
         mss = -1
@@ -88,15 +88,16 @@ def _model1_zone(
                 break
             q += 1
         if mss < 0:
-            j = q + 1 if q <= stop else stop + 1  # resume after the cancel or expiry bar
-            continue
-        i = mss
-        m = _fvg(h, low, j, i)
-        if m >= 0 and c[i] < h[m]:
-            sl = float(h[j : i + 1].max())
-            leg = float(low[j : i + 1].min())
-            out.append({"j": j, "i": i, "m": m, "sl": sl, "leg_end": leg})
-        j = i + 1
+            resume = q + 1 if q <= stop else stop + 1  # bar after the cancel or expiry bar
+        else:
+            i = mss
+            m = _fvg(h, low, j, i)
+            if m >= 0 and c[i] < h[m]:
+                sl = float(h[j : i + 1].max())
+                leg = float(low[j : i + 1].min())
+                out.append({"j": j, "i": i, "m": m, "sl": sl, "leg_end": leg})
+            resume = i + 1
+        q0 = int(np.searchsorted(cand, resume, side="left"))  # later failed breaks while pending are ignored
     return out
 
 
