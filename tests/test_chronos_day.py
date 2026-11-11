@@ -339,7 +339,7 @@ def test_select_order_and_best_only():
 def test_preregistration_has_marker_and_no_results():
     text = (config.REPORTS_DIR / cd.REPORT_NAME).read_text(encoding="utf-8")
     assert text.count(cd.MARKER) == 1
-    headings = [ln.lstrip("#").strip().lower() for ln in text.splitlines() if ln.startswith("#")]
+    headings = [ln.lstrip("#").strip().lower() for ln in text.split(cd.MARKER)[0].splitlines() if ln.startswith("#")]
     assert not any(h.startswith("results") for h in headings)
 
 
@@ -451,3 +451,77 @@ def test_report_lists_skips_and_metrics(tmp_path, monkeypatch):
     assert "355" not in text
     t = pd.read_parquet(ddir / "smoke_chronos" / "08_variants.parquet")
     assert "skip_stale_after_gap" in t.columns
+
+
+# ---- Task 7: --final and always-buy diagnostic --------------------------------------------------
+
+def _final_env(tmp_path, monkeypatch, selected: list[str]):
+    rdir, ddir, _ = _env(tmp_path, monkeypatch)
+    (ddir / "08_selected.json").write_text(json.dumps({"smoke": False, "selected": selected}), encoding="utf-8")
+    (rdir / cd.REPORT_NAME).write_bytes(("pre\n" + cd.MARKER + "\nbody\n").encode())
+    return rdir, ddir
+
+
+def test_final_refuses_second_run(tmp_path, monkeypatch):
+    rdir, _ = _final_env(tmp_path, monkeypatch, ["m2.0|tp2.0|all"])
+    (rdir / cd.MARKER_NAME).write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cd.final_main(FakePredictor)
+
+
+def test_final_refuses_smoke_selection(tmp_path, monkeypatch):
+    rdir, ddir = _final_env(tmp_path, monkeypatch, ["m2.0|tp2.0|all"])
+    (ddir / "08_selected.json").write_text(json.dumps({"smoke": True, "selected": ["m2.0|tp2.0|all"]}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cd.final_main(FakePredictor)
+    assert not (rdir / cd.MARKER_NAME).exists()
+
+
+def test_final_empty_selection_writes_lock_without_loading_data(tmp_path, monkeypatch):
+    rdir, _ = _final_env(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(cd.research, "load_inputs", lambda: (_ for _ in ()).throw(AssertionError("loaded")))
+    cd.final_main(FakePredictor)
+    marker = json.loads((rdir / cd.MARKER_NAME).read_text())
+    assert marker["selected"] == [] and "not run" in marker["note"]
+    text = (rdir / cd.REPORT_NAME).read_bytes().decode()
+    assert cd.research.TEST_HEADING in text and cd.TEST_NOT_RUN_TEXT in text
+    assert "\r" not in text and text.startswith("pre\n" + cd.MARKER)
+    with pytest.raises(SystemExit):
+        cd.final_main(FakePredictor)
+    assert (rdir / cd.REPORT_NAME).read_bytes().decode().count(cd.research.TEST_HEADING) == 1
+
+
+def test_final_marker_written_before_compute(tmp_path, monkeypatch):
+    rdir, _ = _final_env(tmp_path, monkeypatch, ["m2.0|tp2.0|all"])
+    monkeypatch.setattr(config, "TEST_START", "2024-03-04")
+    monkeypatch.setattr(config, "TEST_END", "2024-03-15")
+    seen = {}
+
+    def factory():
+        seen["marker"] = json.loads((rdir / cd.MARKER_NAME).read_text())["selected"]
+        return FakePredictor()
+
+    cd.final_main(factory)
+    assert seen["marker"] == ["m2.0|tp2.0|all"]
+    text = (rdir / cd.REPORT_NAME).read_text(encoding="utf-8")
+    assert "PASS" in text or "FAIL" in text
+    assert (cd.RESEARCH_DATA_DIR / cd.TEST_FORECAST_NAME).exists()
+
+
+def test_always_buy_rows():
+    d = lambda s: pd.Timestamp(s).date()  # noqa: E731
+    times = pd.to_datetime(["2023-01-10 04:00", "2023-01-10 14:00", "2023-01-11 04:00", "2023-01-11 14:00"])
+    m1 = pd.DataFrame({"time": times, "open": [100.0, 105.0, 100.0, 95.0]})  # day 1 up, day 2 down
+    days = pd.DataFrame({
+        "day": [d("2023-01-10"), d("2023-01-11")], "last_close": [100.0, 100.0], "atr": [1.0, 1.0],
+        "entry_time": times[[0, 2]], "exit_time": times[[1, 3]],
+    })
+    fc = pd.DataFrame({"day": days["day"], "median": [101.0, 101.0]})  # Chronos buys both days
+    rows = cd.always_buy_rows(days, fc, m1)
+    r = rows[(rows["flat filter"] == "off") & (rows["year"] == "2023")].iloc[0]
+    assert r["days"] == 2 and r["chronos buy share"] == 1.0
+    assert r["chronos hit rate"] == 0.5 and r["always-buy hit rate"] == 0.5
+    assert rows[(rows["flat filter"] == "off") & (rows["year"] == "2022")].iloc[0]["days"] == 0
+    assert set(rows["year"]) == {"2022", "2023", "2024", "2025", "all"} and len(rows) == 10
+    on = rows[(rows["flat filter"] == "on") & (rows["year"] == "all")].iloc[0]
+    assert on["days"] == 2  # |1.0| >= 0.25 x ATR, so the flat filter keeps both

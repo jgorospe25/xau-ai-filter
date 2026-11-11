@@ -658,6 +658,36 @@ def cost_sensitivity(
     return pd.DataFrame(rows)
 
 
+def always_buy_rows(days: pd.DataFrame, fc: pd.DataFrame, m1: pd.DataFrame) -> pd.DataFrame:
+    """Per flat setting (off / on) and year (plus "all"): days Chronos called, its buy share and hit rate, and the
+    hit rate of always going long on those same days. Hit rate as `hit_rate` (move from entry to time exit)."""
+    rows = []
+    for flat in (False, True):
+        dd = chronos_directions(days, fc, flat)
+        year = pd.to_datetime(dd["day"]).dt.year if len(dd) else pd.Series(dtype=int)
+        for label, part in [(str(y), dd[year == y]) for y in research.SELECT_YEARS] + [("all", dd)]:
+            rows.append({
+                "flat filter": "on" if flat else "off", "year": label, "days": len(part),
+                "chronos buy share": float((part["direction"] == 1).mean()) if len(part) else float("nan"),
+                "chronos hit rate": hit_rate(part, m1),
+                "always-buy hit rate": hit_rate(part.assign(direction=1), m1),
+            })
+    return pd.DataFrame(rows)
+
+
+def always_buy_md(rows: pd.DataFrame) -> list[str]:
+    pct = research._pct
+    shown = [{
+        "flat filter": r["flat filter"], "year": r["year"], "days": int(r["days"]),
+        "Chronos buy share": pct(r["chronos buy share"]), "Chronos hit rate": pct(r["chronos hit rate"]),
+        "always-buy hit rate": pct(r["always-buy hit rate"]),
+    } for _, r in rows.iterrows()]
+    return ["### Added after the results: always-buy comparison (does not change the verdict)", "",
+            research._md(shown), "",
+            "If always buying matches or beats Chronos, then Chronos's edge over a coin flip comes mostly from the "
+            "rising market, not from reading the chart.", ""]
+
+
 def test_section_md(selected: list[str]) -> list[str]:
     body = (
         [f"Not yet run. Selected: {', '.join(f'`{n}`' for n in selected)}. It is run once, on "
@@ -672,7 +702,7 @@ def test_section_md(selected: list[str]) -> list[str]:
 def build_chronos_results(
     table: pd.DataFrame, sens: pd.DataFrame, fc: pd.DataFrame, skipped: pd.DataFrame, warmup_n: int,
     n_days: int, out_dir, trades: dict[str, pd.DataFrame], runtime_s: float, smoke: bool,
-    pkg_version: str | None = None,
+    pkg_version: str | None = None, always_buy: pd.DataFrame | None = None,
 ) -> str:
     """The results markdown placed after MARKER. Every number comes from the arguments."""
     f, pct, md = research._f, research._pct, research._md
@@ -781,6 +811,8 @@ def build_chronos_results(
           "stop), so the stop rarely sits exactly at break-even.",
           "- Win rate is not the criterion; expectancy in R after costs and swap is.",
           "- **The test set has NOT been touched.** It is run once, with `--final`, only for a selected version.", ""]
+    if always_buy is not None:
+        L += always_buy_md(always_buy)
     L += test_section_md(sel)
     return "\n".join(L)
 
@@ -857,19 +889,124 @@ def run(
                    indent=2), encoding="utf-8")
     text = build_chronos_results(
         table, sens, fc, skipped, warm_n, len(days), out_dir, {r["name"]: r["trades"] for r in res},
-        time.time() - t0, smoke,
+        time.time() - t0, smoke, always_buy=always_buy_rows(days, fc, m1),
     )
     write_chronos_report(text, out_dir / (SMOKE_REPORT if smoke else REPORT_NAME))
     _log(f"report written to {out_dir}; selected: {sel or 'none'}", t0)
 
 
+# ---- One-time test year (--final) --------------------------------------------------------------
+
+MARKER_NAME = "08_test_done.json"
+TEST_FORECAST_NAME = "08_forecasts_test.parquet"
+TEST_COLS = ["name", "n", "expectancy_R", "ci95_low", "ci95_high", "coin_mean", "overnight_exp", "verdict"]
+TEST_NOT_RUN_TEXT = (
+    "Not run: no version passed the development selection. Per the pre-registration, the test period "
+    f"{config.TEST_START} .. {config.TEST_END} stays untouched."
+)
+
+
+def run_chronos_test_set(
+    sel: list[str], days: pd.DataFrame, fc: pd.DataFrame, m1: pd.DataFrame, cost: CostParams, swap: SwapParams,
+) -> pd.DataFrame:
+    """Selected versions on the test-year days. PASS needs expectancy >= TEST_MIN_EXP, n >= TEST_MIN_N and
+    bootstrap CI low > TEST_MIN_CI_LO. Also the mean of the coin-flip runs and the overnight rival's expectancy."""
+    by = {v.name: v for v in chronos_grid()}
+    rows = []
+    for name in sel:
+        v = by[name]
+        r = run_chronos_variant(v, days, fc, m1, cost, swap, True)
+        traded = chronos_directions(days, fc, v.flat)
+        traded = traded[traded["day"].isin(set(r["trades"]["day"]))]
+        seed = research.NULL_SEED + 3000 + chronos_grid().index(v)
+        coin = coin_flip_exps(traded, m1, cost, swap, v, config.NULL_REPEATS, seed) if len(traded) else np.array([np.nan])
+        n, exp = int(r["n"]), float(r["expectancy_R"])
+        lo, hi = float(r["ci95_low"]), float(r["ci95_high"])
+        ok = n >= config.TEST_MIN_N and exp >= config.TEST_MIN_EXP and lo > config.TEST_MIN_CI_LO
+        rows.append({"name": name, "n": n, "expectancy_R": exp, "ci95_low": lo, "ci95_high": hi,
+                     "coin_mean": float(np.nanmean(coin)), "overnight_exp": float(r["overnight_exp"]),
+                     "verdict": "PASS" if ok else "FAIL"})
+    return pd.DataFrame(rows, columns=TEST_COLS)
+
+
+def chronos_test_section_md(selected: list[str], results: pd.DataFrame | None = None) -> list[str]:
+    """Lines of the Test set section: not-run text, or (with `results`) the one-time results table."""
+    if results is not None:
+        f = research._f
+        rows = [{
+            "version": r["name"], "n": int(r["n"]), "exp R": f(r["expectancy_R"]),
+            "95% CI": research._ci(r["ci95_low"], r["ci95_high"]), "coin-flip mean R": f(r["coin_mean"]),
+            "overnight exp R": f(r["overnight_exp"]), "verdict": r["verdict"],
+        } for _, r in results.iterrows()]
+        body = [research._md(rows), "",
+                f"PASS = expectancy >= {config.TEST_MIN_EXP:+.2f}R, n >= {config.TEST_MIN_N} and CI low > "
+                f"{config.TEST_MIN_CI_LO:+.2f}R. Bootstrap 95% CI. Coin-flip mean and overnight rival are for context "
+                "(same days, same stops). Run once.", ""]
+    elif not selected:
+        body = [TEST_NOT_RUN_TEXT, ""]
+    else:
+        body = ["Not yet run. Selected: " + ", ".join(f"`{n}`" for n in selected) + ".", ""]
+    return ["", research.TEST_HEADING, ""] + body
+
+
+def _replace_test_section(path, lines: list[str]) -> None:
+    """Replace the Test set section, leaving line endings untouched (the report is LF on Windows)."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    new = "\n".join(lines).strip("\n") + "\n"
+    i = text.find(research.TEST_HEADING)
+    if i < 0:
+        text = text.rstrip("\n") + "\n\n" + new
+    else:
+        j = text.find("\n## ", i + 1)
+        text = text[:i] + new + (text[j:] if j >= 0 else "")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def final_main(predictor_factory: Callable[[], Predictor] = ChronosBoltPredictor) -> None:
+    marker = config.REPORTS_DIR / MARKER_NAME
+    if marker.exists():
+        raise SystemExit(f"{marker} exists: the test set was already run once and must not be run again.")
+    selfile = json.loads((RESEARCH_DATA_DIR / "08_selected.json").read_text(encoding="utf-8"))
+    if selfile.get("smoke"):
+        raise SystemExit("08_selected.json comes from a smoke run: run the full development grid first.")
+    sel = selfile["selected"]
+    report = config.REPORTS_DIR / REPORT_NAME
+    if not sel:
+        marker.write_text(
+            json.dumps({"selected": [], "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "note": "Test not run because nothing was selected."}, indent=2),
+            encoding="utf-8",
+        )
+        _replace_test_section(report, chronos_test_section_md([]))
+        print(TEST_NOT_RUN_TEXT)
+        return
+    marker.write_text(
+        json.dumps({"selected": sel, "timestamp": datetime.now().isoformat(timespec="seconds")}, indent=2),
+        encoding="utf-8",
+    )
+    inp = research.load_inputs()
+    h1, m1 = inp.bars["H1"], inp.bars["M1"]
+    days, _ = day_table(h1, m1, config.TEST_START, config.TEST_END)
+    days = days.loc[~warmup_mask(days, h1)].reset_index(drop=True) if len(days) else days
+    fc = load_or_build_forecasts(days, h1, predictor_factory, RESEARCH_DATA_DIR / TEST_FORECAST_NAME)
+    res = run_chronos_test_set(sel, days, fc, m1, _cost_params(inp), _swap_params(inp))
+    _replace_test_section(report, chronos_test_section_md(sel, res))
+    print(res.to_string(index=False))
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Batch 3: Chronos H1 day trade")
     g = ap.add_mutually_exclusive_group()
+    g.add_argument("--final", action="store_true", help="run the selected version on the test year, once")
     g.add_argument("--forecasts", action="store_true", help="build or reuse the development forecast cache")
     g.add_argument("--smoke", action="store_true",
                    help=f"{SMOKE_DAYS} days, 3 versions; writes only to data/research/{SMOKE_DIR}/")
     args = ap.parse_args(argv)
+    if args.final:
+        final_main()
+        return
     run("forecasts" if args.forecasts else "smoke" if args.smoke else "full")
 
 

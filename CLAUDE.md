@@ -9,6 +9,7 @@ only trades signals above a probability threshold.
 - Accounts: Standard USD and Standard Cent (USC). Lot sizing must work for both via tick value.
 - Timeframe: **H1 first**. M5 is a later phase, not now.
 - Env: Windows PowerShell, Python via `uv`. MT5 terminal must be running and logged in for data export.
+- Optional extra for batch 3 (Chronos, torch): run as `uv run --extra chronos ...`.
 - Existing indicator: `mql5/XAU_EMA_RSI_Signal.mq5` (v1.1) — the **source of truth** for signal rules.
 - MT5 data folder: `C:\Users\joshua\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075` (MQL5/Experts, MQL5/Files live here)
 - MetaEditor: `C:\Program Files\MetaTrader 5\MetaEditor64.exe` (CLI compile: `/compile:<file.mq5> /log`)
@@ -102,6 +103,7 @@ src/xauai/
   research.py      # Part B/C: 208-variant grid, null baseline, selection, one-time test (--final)
   setups_ict.py    # ICT models 1 (FVG after MSS), 3 (OTE) and 5 (Asian-range box), limit-order signals
   research_ict.py  # batch 2: 144-variant ICT grid, null baseline, selection, one-time test (--final)
+  chronos_day.py   # batch 3: zero-shot Chronos direction for one H1 day trade (10:00 PH → 12:00 London)
 mql5/
   XAU_EMA_RSI_Signal.mq5   # existing indicator (do not change rules)
   DumpSignals.mq5          # script: iCustom on indicator → CSV for parity tests
@@ -149,6 +151,12 @@ Breakeven win rate at 1:2 RR = 33.3%.
    and Asian-range box breakout. **Result (2026-11-11): FAIL** — 144 variants (72 eligible M5; 352 / 136 cumulative
    with batch 1) tested on 2022-05-16..2025-10-23 with real costs; no eligible variant with n >= 100 was positive in
    every year; nothing selected; test set untouched. See `reports/07_ict_models.md`.
+10. Research batch 3 (Chronos H1 day trade): zero-shot Chronos-Bolt direction call, rules only, pre-registered.
+   **Result (2026-11-11): FAIL** — 18 versions (all eligible; 370 / 154 cumulative) of a zero-shot Chronos-Bolt direction
+   call at 10:00 PH, exit by 12:00 London, H1 stops 1.5–3 × ATR, tested on 2022-06-16..2025-10-23 with real costs;
+   small positive expectancy (best ≈ +0.02R, CI includes 0), every version negative in 2023; Chronos mostly called
+   "buy" in a rising market and always-buy had a higher hit rate; nothing selected; test set untouched. See
+   `reports/08_chronos.md`.
 
 ## Conventions
 - Type hints, small pure functions, pytest for indicators/labels/parity.
