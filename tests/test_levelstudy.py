@@ -49,7 +49,7 @@ def test_below_side_mirrors():
     # level 100 below price; touched by low; reversal = high >= 102
     rev = _m1([(105, 106, 104, 105), (101, 102, 100, 101), (101, 102.5, 100.5, 102)])
     assert level_reaction(rev, 100.0, -1, START, END, 2.0) == "reversed"
-    brk = _m1([(105, 106, 104, 105), (101, 102, 100, 101), (100, 100.5, 97.5, 98)])
+    brk = _m1([(105, 106, 104, 105), (101, 101.5, 100, 101), (100, 100.5, 97.5, 98)])
     assert level_reaction(brk, 100.0, -1, START, END, 2.0) == "broke"
 
 

@@ -7,8 +7,10 @@ the real levels of OTHER sessions transplanted (same signed distance in ATR unit
 FVG fill study: share of big H1 FVG midpoints reached within 1/4/12/24/48 h of `known_at`, vs random points
 at the same signed ATR distance from random other H1 closes.
 
-Outcome codes: 0 untouched, 1 reversed, 2 broke, 3 touched_no_resolution. A bar that both reverses and goes
-through (or touches and goes through) is counted as "broke" (conservative: unknown intrabar order).
+Outcome codes: 0 untouched, 1 reversed, 2 broke, 3 touched_no_resolution. The touch bar counts for the
+reversal check (its low, for a level above). A bar that both reverses and goes through (including the touch
+bar) is counted as "broke" (conservative: unknown intrabar order).
+Only M1 data up to DEV_END 23:59:59 is read: sessions / FVG horizons / random pools that pass it are dropped.
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def _codes_above(h: np.ndarray, l: np.ndarray, p: np.ndarray, atr: float) -> np.
     t0 = np.searchsorted(c, p, side="left")  # first bar with high >= p
     touched = t0 < n
     tt = np.searchsorted(c, p + atr, side="left")  # first bar with high >= p + atr
-    lo, hi = t0 + 1, tt  # reversal can only happen strictly after the touch bar and before the through bar
+    lo, hi = t0, tt  # reversal window = touch bar .. bar before the through bar; a bar that also goes through = broke
     has = touched & (hi > lo)
     length = np.where(has, hi - lo, 1)
     k = np.floor(np.log2(length)).astype(int)
@@ -141,11 +143,15 @@ def build_sessions(inp: Inputs) -> pd.DataFrame:
     t = m1["time"].to_numpy()
     lo, hi = pd.Timestamp(config.DEV_START), pd.Timestamp(config.DEV_END) + _DAY
     rows = []
+    dropped = 0
     for i in range(len(w) - 1):
         s = w.at[i, "start"]
         if not (lo <= s < hi):
             continue
         e = max(w.at[i, "end"], w.at[i + 1, "end"])
+        if e > hi - pd.Timedelta(seconds=1):  # window would read past DEV_END 23:59:59
+            dropped += 1
+            continue
         a = int(np.searchsorted(t, s.to_datetime64(), side="left"))
         b = int(np.searchsorted(t, e.to_datetime64(), side="left"))
         if b <= a or pd.Timestamp(t[a]) - s > _H1:
@@ -154,7 +160,9 @@ def build_sessions(inp: Inputs) -> pd.DataFrame:
         if np.isnan(atr) or atr <= 0:
             continue
         rows.append((s, e, w.at[i, "session"], a, b, float(m1["open"].iloc[a]), atr))
-    return pd.DataFrame(rows, columns=["start", "end", "session", "a", "b", "open", "atr"])
+    out = pd.DataFrame(rows, columns=["start", "end", "session", "a", "b", "open", "atr"])
+    out.attrs["dropped_past_dev_end"] = dropped
+    return out
 
 
 def eval_by_session(sess: pd.DataFrame, m1: pd.DataFrame, q_sess: np.ndarray, q_d: np.ndarray) -> np.ndarray:
@@ -206,7 +214,7 @@ def level_study(inp: Inputs, n_random: int = N_RANDOM, seed: int = SEED) -> tupl
         rt, rr = int(g["r_touch"].sum()), int(g["r_rev"].sum())
         rn = nn * n_random
         rows.append({
-            "kind": kind, "n": nn,
+            "kind": kind, "n": nn, "n_touched": touched,
             "touch%": 100 * touched / nn,
             "reversal% of touched": 100 * rev / touched if touched else np.nan,
             "broke% of touched": 100 * int((g["real"] == 2).sum()) / touched if touched else np.nan,
@@ -216,6 +224,10 @@ def level_study(inp: Inputs, n_random: int = N_RANDOM, seed: int = SEED) -> tupl
             "random broke%": 100 * int(g["r_broke"].sum()) / rt if rt else np.nan,
         })
     summ = pd.DataFrame(rows)
+    summ["touch +-"] = 1.96 * 100 * np.sqrt(summ["touch%"] / 100 * (1 - summ["touch%"] / 100) / summ["n"])
+    summ["reversal +-"] = 1.96 * 100 * np.sqrt(
+        summ["reversal% of touched"] / 100 * (1 - summ["reversal% of touched"] / 100) / summ["n_touched"])
+    summ.attrs["dropped_sessions"] = sess.attrs.get("dropped_past_dev_end", 0)
     summ["touch diff (pp)"] = summ["touch%"] - summ["random touch%"]
     summ["reversal diff (pp)"] = summ["reversal% of touched"] - summ["random reversal%"]
     return summ, lv
@@ -228,7 +240,10 @@ def fvg_study(inp: Inputs, n_random: int = N_RANDOM, seed: int = SEED) -> pd.Dat
     t = m1["time"].to_numpy()
     h_all, l_all = m1["high"].to_numpy(float), m1["low"].to_numpy(float)
     lo, hi = pd.Timestamp(config.DEV_START), pd.Timestamp(config.DEV_END) + _DAY
-    g = inp.gaps[(inp.gaps["known_at"] >= lo) & (inp.gaps["known_at"] < hi)].reset_index(drop=True)
+    in_dev = inp.gaps[(inp.gaps["known_at"] >= lo) & (inp.gaps["known_at"] < hi)]
+    keep = in_dev["known_at"] + pd.Timedelta(hours=48) <= hi - pd.Timedelta(seconds=1)  # 48 h horizon inside DEV
+    g = in_dev[keep].reset_index(drop=True)
+    n_dropped = int((~keep).sum())
     h1o = pd.DatetimeIndex(h1["time"])
     close_by_open = pd.Series(h1["close"].to_numpy(float), index=h1o)
     atr_by_open = inp.h1_atr.reindex(h1o)
@@ -239,7 +254,7 @@ def fvg_study(inp: Inputs, n_random: int = N_RANDOM, seed: int = SEED) -> pd.Dat
     real = np.array([fill_hours(m1, k, mid, int(s)) for k, mid, s in zip(g["known_at"], g["mid"], sides)])
     # random bases: dev-period H1 bars with a valid ATR (known at their close)
     bt = h1o + _H1
-    ok = (bt >= lo) & (bt < hi) & ~np.isnan(atr_by_open.to_numpy())
+    ok = (bt >= lo) & (bt + pd.Timedelta(hours=48) <= hi - pd.Timedelta(seconds=1)) & ~np.isnan(atr_by_open.to_numpy())
     base_t = bt[ok].to_numpy()
     base_c, base_a = close_by_open.to_numpy()[ok], atr_by_open.to_numpy()[ok]
     rng = np.random.default_rng(seed)
@@ -264,6 +279,7 @@ def fvg_study(inp: Inputs, n_random: int = N_RANDOM, seed: int = SEED) -> pd.Dat
     g = g.assign(real_h=real)
     g["session"] = assign_session(g["known_at"], inp.windows)["session"].to_numpy()
     g.attrs["rand"] = flat.reshape(pick.shape)
+    g.attrs["dropped"] = n_dropped
     return g
 
 
@@ -332,6 +348,10 @@ def build_report(summ: pd.DataFrame, lv: pd.DataFrame, g: pd.DataFrame, charts: 
     w(f"Generated by `src/xauai/levelstudy.py` at {datetime.now():%Y-%m-%d %H:%M} (local). All numbers below come from that script. "
       f"Development period only: {config.DEV_START} .. {config.DEV_END}. Random seed {SEED}; {N_RANDOM} random placements per real level / per FVG.\n")
     w("## Definitions in plain words\n")
+    w("- **Terms.** *M1* = one-minute candles (the finest data used to decide what was touched first). *ATR* = Average True Range, "
+      "the typical candle size; here the average over the last 14 H1 (hourly) candles, used as a yardstick for 'distance'. "
+      "*Volume profile* = how much trading volume happened at each price in the previous session. "
+      "*Candle 1 / candle 3* of an FVG = the first and third of three consecutive H1 candles; the gap is the empty space between candle 1's extreme and candle 3's.")
     w("- **Level kinds.** pdh/pdl = previous day's high/low; pwh/pwl = previous week's high/low; psh/psl = high/low of the "
       "previous trading session; swh/swl = the last swing high/low of the previous session; poc = price with the most volume in "
       "the previous session's volume profile; vah/val = top/bottom of the zone holding 70% of that volume.")
@@ -341,7 +361,7 @@ def build_report(summ: pd.DataFrame, lv: pd.DataFrame, g: pd.DataFrame, charts: 
     w("- **The window.** From the session start to the end of the NEXT session (the session itself plus the one after it), measured on M1 bars.")
     w("- **Touched.** Price reaches the level (M1 high >= level for a level above, M1 low <= level for one below) inside the window.")
     w("- **Reversed / broke.** After the first touch we watch what happens first: price moving 1 ATR back away from the level "
-      "(towards the session open) = *reversed*; price moving 1 ATR through it = *broke*. If a single M1 bar contains both, it is counted as *broke* "
+      "(towards the session open) = *reversed* (price bounced back at least one ATR); price moving 1 ATR through it = *broke*. The touch bar's own low (for a level above) counts for the reversal check. If a single M1 bar contains both, it is counted as *broke* "
       "(we cannot know the order). If neither happens before the window ends it is *touched, no resolution*, reported separately. "
       "'Reversal %' is the share of **touched** levels that reversed.")
     w(f"- **Random comparison.** Chance level: for each real level we take {N_RANDOM} OTHER sessions at random and put a level at the same signed "
@@ -356,9 +376,15 @@ def build_report(summ: pd.DataFrame, lv: pd.DataFrame, g: pd.DataFrame, charts: 
       "volatility would give you) and its **reversal %** higher than random if it acts as support/resistance. A difference of a few percentage points is "
       "probably noise; look for gaps that are large and that repeat across related kinds. The FVG tables answer 'does price always fill FVGs?': "
       "compare real with random at each horizon. If both are close, FVGs are filled about as often as any nearby price would be touched.\n")
-    w(f"Sessions in study: {lv['sess'].nunique()}; real levels evaluated: {len(lv)}; FVGs: {len(g)}.\n")
+    w(f"Sessions in study: {lv['sess'].nunique()}; real levels evaluated: {len(lv)}; FVGs: {len(g)}. "
+      f"Dropped so that no data after {config.DEV_END} 23:59:59 is read: {summ.attrs.get('dropped_sessions', 0)} sessions "
+      f"(window ends after it) and {g.attrs.get('dropped', 0)} FVGs (48 h horizon passes it); random pools use the same rule.\n")
+    w("**Noise bands:** `touch +-` and `reversal +-` are approximate 95% binomial half-widths (1.96*sqrt(p(1-p)/n)) on the real rate, "
+      "in percentage points; a `diff` smaller than about that is indistinguishable from noise. The random pool is NOT matched by "
+      "session type (Asia/London/NY), only by distance and side, so small systematic differences can come from that.\n")
     w("## Level study per kind\n")
-    cols = ["kind", "n", "touch%", "random touch%", "touch diff (pp)", "reversal% of touched", "random reversal%", "reversal diff (pp)",
+    cols = ["kind", "n", "touch%", "touch +-", "random touch%", "touch diff (pp)", "reversal% of touched", "reversal +-",
+            "random reversal%", "reversal diff (pp)",
             "broke% of touched", "no-resolution% of touched", "random broke%"]
     w(table(summ[cols], floatfmt=".1f") + "\n")
     w("`diff (pp)` = real minus random, in percentage points.\n")
