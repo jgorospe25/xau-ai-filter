@@ -100,6 +100,8 @@ src/xauai/
   sim.py           # generalised M1 trade simulator for setup signals, in R net of costs
   levelstudy.py    # Part A: level touch/reversal study and FVG fill study
   research.py      # Part B/C: 208-variant grid, null baseline, selection, one-time test (--final)
+  setups_ict.py    # ICT models 1 (FVG after MSS), 3 (OTE) and 5 (Asian-range box), limit-order signals
+  research_ict.py  # batch 2: 144-variant ICT grid, null baseline, selection, one-time test (--final)
 mql5/
   XAU_EMA_RSI_Signal.mq5   # existing indicator (do not change rules)
   DumpSignals.mq5          # script: iCustom on indicator → CSV for parity tests
@@ -143,6 +145,10 @@ Breakeven win rate at 1:2 RR = 33.3%.
    **Result (2026-11-11): FAIL** — 208 variants (64 eligible M5) tested on 2022-05-16..2025-10-23 with real
    costs; no eligible variant was positive in every year; nothing selected; test set untouched. See
    `reports/05_levels.md` (no level beat random) and `reports/06_setups.md`.
+9. Research batch 2 (ICT entry models): rules only (no ML), pre-registered; limit-order entries (FVG after MSS, OTE)
+   and Asian-range box breakout. **Result (2026-11-11): FAIL** — 144 variants (72 eligible M5; 352 / 136 cumulative
+   with batch 1) tested on 2022-05-16..2025-10-23 with real costs; no eligible variant with n >= 100 was positive in
+   every year; nothing selected; test set untouched. See `reports/07_ict_models.md`.
 
 ## Conventions
 - Type hints, small pure functions, pytest for indicators/labels/parity.

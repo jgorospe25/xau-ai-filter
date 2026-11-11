@@ -101,3 +101,10 @@ def combined_trend(at: pd.Series, m30: pd.DataFrame, h1: pd.DataFrame) -> np.nda
     a = _trend_at(at, m30, "M30")
     b = _trend_at(at, h1, "H1")
     return np.where(a == b, a, 0)
+
+
+def htf_direction(at: pd.Series, h4: pd.DataFrame, h1: pd.DataFrame) -> np.ndarray:
+    """+1/-1 only where H4 and H1 trends agree, else 0, at decision times `at`."""
+    a = _trend_at(at, h4, "H4")
+    b = _trend_at(at, h1, "H1")
+    return np.where(a == b, a, 0)

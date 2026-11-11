@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from conftest import make_bars
 
-from xauai.structure import combined_trend, swing_points, trend_series
+from xauai.structure import combined_trend, htf_direction, swing_points, trend_series
 
 
 def test_swing_high_is_wick_and_confirmed_n_bars_later():
@@ -86,3 +86,21 @@ def test_combined_trend_requires_agreement():
     assert both[0] == 0  # nothing closed yet
     assert both[-1] == 1
     assert set(np.unique(both)) <= {0, 1}
+
+
+def test_htf_direction_requires_h4_and_h1_agree():
+    def zigzag(prices):
+        rows = []
+        for hi, lo in prices:
+            rows += [(5, 6, 4, 5), (5, 6, 4, 5), (5, hi, lo, 5), (5, 6, 4, 5), (5, 6, 4, 5)]
+        return rows
+    up = zigzag([(10, 3), (12, 3.5), (14, 3.8), (16, 3.9)])
+    dn = zigzag([(16, 3.9), (14, 3.8), (12, 3.5), (10, 3)])
+    h4_up = make_bars(up, "2024-01-15 01:00", "4h")
+    h1_up = make_bars(up, "2024-01-15 01:00", "h")
+    h1_dn = make_bars(dn, "2024-01-15 01:00", "h")
+    at = pd.Series(pd.date_range("2024-01-15 00:00", periods=100, freq="h"))
+    both = htf_direction(at, h4_up, h1_up)
+    mixed = htf_direction(at, h4_up, h1_dn)
+    assert both.shape == (100,) and both[-1] == 1
+    assert (mixed == 0).all()

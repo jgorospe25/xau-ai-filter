@@ -1,7 +1,17 @@
 import pandas as pd
 
 from conftest import make_bars
-from xauai.timeutil import TF_LEN, assign_session, previous_session, server_to_utc, session_windows, utc_to_server
+from xauai.timeutil import (
+    TF_LEN,
+    assign_session,
+    in_windows,
+    local_windows,
+    previous_session,
+    server_to_utc,
+    session_windows,
+    time_filter_mask,
+    utc_to_server,
+)
 
 
 def test_server_offset_winter_and_us_dst():
@@ -49,3 +59,53 @@ def test_tf_len_and_make_bars():
     assert TF_LEN["H1"] == pd.Timedelta(hours=1) and TF_LEN["M1"] == pd.Timedelta(minutes=1)
     b = make_bars([(1, 2, 0, 1)] * 3, "2024-01-01", "h")
     assert list(b.columns) == ["time", "open", "high", "low", "close", "tick_volume", "spread"]
+
+
+def test_asia_box_window_crosses_midnight_winter():
+    w = local_windows("2025-01-06", "2025-01-06", "America/New_York", 20, 24)
+    assert len(w) == 1
+    assert w.iloc[0].start == pd.Timestamp("2025-01-07 03:00") and w.iloc[0].end == pd.Timestamp("2025-01-07 07:00")
+
+
+def test_asia_box_window_summer():
+    w = local_windows("2025-07-07", "2025-07-07", "America/New_York", 20, 24)
+    assert len(w) == 1
+    assert w.iloc[0].start == pd.Timestamp("2025-07-08 03:00") and w.iloc[0].end == pd.Timestamp("2025-07-08 07:00")
+
+
+def test_killzone_us_only_dst_week():
+    for day in ("2025-03-10", "2025-03-03"):  # server and NY shift together
+        w = local_windows(day, day, "America/New_York", 7, 10)
+        assert w.iloc[0].start == pd.Timestamp(f"{day} 14:00") and w.iloc[0].end == pd.Timestamp(f"{day} 17:00")
+
+
+def test_owner_hours_manila_fixed_offset():
+    w = local_windows("2025-01-06", "2025-01-06", "Asia/Manila", 8, 18)
+    assert w.iloc[0].start == pd.Timestamp("2025-01-06 02:00") and w.iloc[0].end == pd.Timestamp("2025-01-06 12:00")
+    w = local_windows("2025-07-07", "2025-07-07", "Asia/Manila", 8, 18)
+    assert w.iloc[0].start == pd.Timestamp("2025-07-07 03:00") and w.iloc[0].end == pd.Timestamp("2025-07-07 13:00")
+
+
+def test_in_windows_half_open():
+    w = pd.DataFrame({"start": [pd.Timestamp("2025-01-06 02:00")], "end": [pd.Timestamp("2025-01-06 12:00")]})
+    t = pd.Series(pd.to_datetime(["2025-01-06 01:59", "2025-01-06 02:00", "2025-01-06 11:59", "2025-01-06 12:00"]))
+    assert list(in_windows(t, w)) == [False, True, True, False]
+
+
+def test_time_filter_none_all_true():
+    t = pd.Series(pd.date_range("2025-01-06", periods=48, freq="h"))
+    assert time_filter_mask(t, "none").all()
+    m = time_filter_mask(t, "owner")
+    assert m.dtype == bool and 0 < m.sum() < len(t)
+
+
+def test_time_filter_empty_and_nat():
+    empty = pd.Series(pd.to_datetime([]))
+    for mode in ("none", "killzone", "owner"):
+        m = time_filter_mask(empty, mode)
+        assert m.dtype == bool and len(m) == 0
+    # 2025-01-06 (NY winter): kill zone 02-05 NY = 09-12 server
+    t = pd.Series(pd.to_datetime(["2025-01-06 10:00", None, "2025-01-06 13:00"]))
+    assert list(time_filter_mask(t, "killzone")) == [True, False, False]
+    assert list(time_filter_mask(t, "none")) == [True, False, True]
+    assert not time_filter_mask(pd.Series([pd.NaT, pd.NaT]), "owner").any()

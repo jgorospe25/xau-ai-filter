@@ -105,3 +105,50 @@ def previous_session(t: pd.Timestamp, windows: pd.DataFrame) -> pd.Series | None
     if done.empty:
         return None
     return done.loc[done["end"].idxmax()] if done["end"].is_unique else done.sort_values(["end", "start"]).iloc[-1]
+
+
+def local_windows(start: str, end: str, zone: str, h0: int, h1: int) -> pd.DataFrame:
+    """Windows [h0, h1) in local `zone` for every calendar day start..end inclusive (server time).
+
+    Columns start, end; sorted by start. Weekends are included (windows without bars are harmless).
+    h1 = 24 means the next day's local midnight.
+    """
+    tz = ZoneInfo(zone)
+    rows: list[tuple[datetime, datetime]] = []
+    for d in pd.date_range(start, end, freq="D"):
+        day = datetime(d.year, d.month, d.day)
+        s = (day + timedelta(hours=h0)).replace(tzinfo=tz).astimezone(_UTC).replace(tzinfo=None)
+        e = (day + timedelta(hours=h1)).replace(tzinfo=tz).astimezone(_UTC).replace(tzinfo=None)
+        rows.append((s, e))
+    df = pd.DataFrame(rows, columns=["start", "end"])
+    df["start"] = utc_to_server(pd.to_datetime(df["start"]))
+    df["end"] = utc_to_server(pd.to_datetime(df["end"]))
+    return df.sort_values("start").reset_index(drop=True)
+
+
+def in_windows(times: pd.Series, windows: pd.DataFrame) -> np.ndarray:
+    """Bool mask: start <= t < end for some window (windows must not overlap)."""
+    w = windows.sort_values("start")
+    starts = w["start"].to_numpy()
+    ends = w["end"].to_numpy()
+    t = pd.to_datetime(times).to_numpy()
+    idx = np.searchsorted(starts, t, side="right") - 1
+    ok = idx >= 0
+    return ok & (t < ends[np.where(ok, idx, 0)])
+
+
+def time_filter_mask(times: pd.Series, mode: str) -> np.ndarray:
+    """Bool mask of times inside the config.TIME_FILTERS[mode] windows; all True for "none".
+    NaT is always False; empty input gives an empty mask."""
+    spec = config.TIME_FILTERS[mode]
+    t = pd.Series(pd.to_datetime(pd.Series(times)).to_numpy())
+    ok = t.notna().to_numpy()
+    if not spec or not ok.any():
+        return ok
+    v = t[ok]
+    lo = (v.min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    hi = (v.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    w = pd.concat([local_windows(lo, hi, z, a, b) for z, a, b in spec], ignore_index=True)
+    out = np.zeros(len(t), dtype=bool)
+    out[ok] = in_windows(v, w)
+    return out
