@@ -261,7 +261,7 @@ def _model5_box(
                 break
             q += 1
         if f < 0:
-            i = q + 1  # cancelled, or no close back inside within K
+            i = q + 1 if q <= last else q  # after the cancel bar, or right after the expiry window
             continue
         last = min(f + k, end - 1)
         r = -1
@@ -275,7 +275,7 @@ def _model5_box(
             q += 1
         if r >= 0:
             out.append((r, b))
-        i = q + 1  # after the signal, the cancel or the expiry
+        i = q + 1 if q <= last else q  # after the signal / cancel bar, or right after the expiry window
     return out
 
 

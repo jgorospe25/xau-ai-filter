@@ -229,6 +229,12 @@ def test_model1_sl_equal_limit_no_signal():
         (98.8, 102.5, 97.0, 97.5),  # 26 MSS (close < 98.5); high 102.5 >= low[24] so no newer gap
     ]
     assert model1(bars(rows), "M5", zones((103, 1))).empty
+    # control: a slightly higher wick on the MSS bar makes sl 103.2 > limit 103.0 -> signal
+    ok = rows[:-1] + [(98.8, 103.2, 97.0, 97.5)]
+    sig = model1(bars(ok), "M5", zones((103, 1)))
+    assert len(sig) == 1
+    assert sig["sl"].iloc[0] == pytest.approx(103.2)
+    assert sig["limit_price"].iloc[0] == pytest.approx(103.0)
 
 
 # --- Asian box and Model 5 ---------------------------------------------------------------------
@@ -351,6 +357,15 @@ def test_model5_retest_after_k_no_signal():
     assert len(model5(m5_bars(ok), "M5", BOX)) == 1
     late = M5_SELL[:2] + [away] * 12 + [(98.0, 100.0, 97.5, 99.0)]  # r = f + 13
     assert model5(m5_bars(late), "M5", BOX).empty
+
+
+def test_model5_new_breakout_right_after_retest_expiry():
+    away = (98.0, 98.5, 97.0, 97.5)
+    rows = M5_SELL[:2] + [away] * 12 + M5_SELL[:2] + [(99.2, 100.0, 98.0, 99.0)]
+    # f = bar 25, retest window ends at bar 37; bar 38 is a new breakout start, f' = 39, retest r = 40
+    sig = model5(m5_bars(rows), "M5", BOX)
+    assert sig["signal_time"].tolist() == [M(40)]
+    assert sig["sl"].iloc[0] == pytest.approx(101.5)
 
 
 def test_model5_buy_mirror():
