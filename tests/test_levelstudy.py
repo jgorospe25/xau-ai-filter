@@ -102,3 +102,18 @@ def test_fvg_random_points_same_side_same_distance():
     px = transplant_points(d, closes[idx], atrs[idx])
     assert np.all(px < closes[idx])
     assert np.allclose((px - closes[idx]) / atrs[idx], d)
+
+
+def test_touch_bar_reversal_above():
+    m1 = _m1([(99, 100, 97.5, 98)])  # touches 100 and drops to 97.5 (<= 98) without reaching 102
+    assert level_reaction(m1, 100.0, 1, START, END, 2.0) == "reversed"
+
+
+def test_touch_bar_reversal_below():
+    m1 = _m1([(101, 102, 100, 101.5)])  # touches 100 and rises to 102 (>= 102) without reaching 98
+    assert level_reaction(m1, 100.0, -1, START, END, 2.0) == "reversed"
+
+
+def test_touch_bar_with_both_is_broke():
+    m1 = _m1([(99, 102.5, 97.5, 100)])
+    assert level_reaction(m1, 100.0, 1, START, END, 2.0) == "broke"
