@@ -417,3 +417,37 @@ def test_forecasts_dev_days_only_and_full_report_keeps_bytes(tmp_path, monkeypat
     sel = json.loads((ddir / "08_selected.json").read_text())
     assert sel["smoke"] is False and sel["selected"] == []
     assert len(pd.read_parquet(ddir / "08_variants.parquet")) == 18
+
+
+def test_dev_guard_trips_on_trade_after_dev_end(monkeypatch):
+    monkeypatch.setattr(config, "DEV_END", "2024-03-15")
+    ok = pd.DataFrame({"signal_time": [pd.Timestamp("2024-03-15 05:00")], "exit_time": [pd.Timestamp("2024-03-15 14:00")]})
+    cd.assert_dev_only_chronos(ok)
+    for col in ("signal_time", "exit_time"):
+        with pytest.raises(RuntimeError):
+            cd.assert_dev_only_chronos(ok.assign(**{col: pd.Timestamp("2024-03-16 00:00")}))
+    with pytest.raises(RuntimeError):
+        cd.assert_dev_only_chronos(ok, pd.DataFrame({"day": [pd.Timestamp("2024-03-18").date()]}))
+
+
+def test_stale_cache_exits(tmp_path, monkeypatch):
+    rdir, ddir, _ = _env(tmp_path, monkeypatch)
+    cd.run("forecasts", FakePredictor, model_id="fake/model")
+    p = ddir / "08_forecasts.parquet"
+    fc = pd.read_parquet(p)
+    fc["last_close"] += 1.0
+    fc.to_parquet(p, index=False)
+    with pytest.raises(SystemExit, match="delete"):
+        cd.run("full", FakePredictor, model_id="fake/model")
+
+
+def test_report_lists_skips_and_metrics(tmp_path, monkeypatch):
+    rdir, ddir, _ = _env(tmp_path, monkeypatch)
+    cd.run("smoke", FakePredictor, model_id="fake/model")
+    text = (ddir / "smoke_chronos" / "08_chronos_smoke.md").read_text(encoding="utf-8")
+    for h in ("total R", "PF", "max DD R", "trades/mo", "stale_after_gap", "sl_behind_fill", "zero_forecast",
+              "flat_filter", "full run has 18"):
+        assert h in text, h
+    assert "355" not in text
+    t = pd.read_parquet(ddir / "smoke_chronos" / "08_variants.parquet")
+    assert "skip_stale_after_gap" in t.columns

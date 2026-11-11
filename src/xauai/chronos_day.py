@@ -452,6 +452,11 @@ def run_chronos_variant(
     out = research.flat_metrics(trades)
     out["name"] = v.name
     out["n_skipped"] = len(skipped)
+    out["skips"] = {str(k): int(n) for k, n in skipped["reason"].value_counts().items()}
+    joined = days.merge(fc[["day", "median"]], on="day", how="inner")
+    diff = joined["median"].to_numpy(float) - joined["last_close"].to_numpy(float)
+    out["n_zero_forecast"] = int((diff == 0).sum())
+    out["n_flat_dropped"] = int(((diff != 0) & (np.abs(diff) < _FLAT_ATR * joined["atr"].to_numpy(float))).sum()) if v.flat else 0
     out["hit_rate"] = hit_rate(dd[dd["day"].isin(set(trades["day"]))], m1) if len(trades) else float("nan")
     out["breakeven_wr"] = _breakeven_wr(trades["r"]) if len(trades) else float("nan")
     out.update(beat_share=float("nan"), overnight_exp=float("nan"), overnight_n=0)
@@ -504,6 +509,9 @@ SMOKE_VARIANTS = ("m2.0|tp2.0|all", "m2.0|be_trail|flat", "m3.0|tp1.5|all")
 SMOKE_DAYS = 60
 SMOKE_REPEATS = 3
 PRIOR_TRIED, PRIOR_ELIGIBLE = 208 + 144, 64 + 72  # batches 1 and 2
+SIM_SKIP_REASONS = (
+    "no_entry_bar", "stale_after_gap", "entry_after_friday_close", "no_exit_after_entry", "sl_behind_fill",
+)
 _CHECK_ORDER = {"": 4, "overnight": 3, "null": 2, "years": 1, "n": 0}
 
 
@@ -545,14 +553,31 @@ def _cached(days: pd.DataFrame, path, model_id: str) -> pd.DataFrame | None:
     cache = pd.read_parquet(path)
     if len(cache) == 0 or not (cache["model_id"] == model_id).all() or not set(days["day"]) <= set(cache["day"]):
         return None
-    return cache[cache["day"].isin(set(days["day"]))].reset_index(drop=True)
+    out = cache[cache["day"].isin(set(days["day"]))].reset_index(drop=True)
+    j = days[["day", "last_close", "horizon"]].merge(out[["day", "last_close", "horizon"]], on="day", suffixes=("", "_c"))
+    if (np.abs(j["last_close"] - j["last_close_c"]) > 1e-9).any() or (j["horizon"] != j["horizon_c"]).any():
+        raise SystemExit(f"forecast cache {path} does not match the current data (last_close or horizon differ): "
+                         "delete it and rerun --forecasts")
+    return out
+
+
+def assert_dev_only_chronos(trades: pd.DataFrame, fc: pd.DataFrame | None = None) -> None:
+    """Every trade signal/exit time and every forecast day must be <= DEV_END 23:59:59 (test year untouched)."""
+    hi = pd.Timestamp(config.DEV_END) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    for col in ("signal_time", "exit_time"):
+        if len(trades) and pd.Timestamp(trades[col].max()) > hi:
+            raise RuntimeError(f"trade {col} after {hi}: test period leaked")
+    if fc is not None and len(fc) and pd.Timestamp(max(fc["day"])) > hi:
+        raise RuntimeError(f"forecast day after {hi}: test period leaked")
 
 
 def results_table(res: list[dict]) -> pd.DataFrame:
     """One row per version (trades dropped), hit-rate Wilson CI added, then chronos_select columns."""
     rows = []
     for r in res:
-        row = {k: v for k, v in r.items() if k != "trades"}
+        row = {k: v for k, v in r.items() if k not in ("trades", "skips")}
+        for reason in SIM_SKIP_REASONS:
+            row[f"skip_{reason}"] = int(r["skips"].get(reason, 0))
         row["hit_lo"], row["hit_hi"] = _wilson(row["hit_rate"], int(row["n"]))
         rows.append(row)
     return chronos_select(pd.DataFrame(rows))
@@ -627,6 +652,7 @@ def cost_sensitivity(
         dd = chronos_directions(days, fc, v.flat)
         for c in config.SENSITIVITY_TOTAL_COSTS:
             tr, _ = simulate_days(dd, m1, _cost_params(inp, c), swap, v.m, v.exit_style)
+            assert_dev_only_chronos(tr)
             row[f"total {c:.2f}"] = research._f(float(tr["r"].mean()) if len(tr) else float("nan"))
         rows.append(row)
     return pd.DataFrame(rows)
@@ -678,7 +704,10 @@ def build_chronos_results(
         f"expectancy of {f(med)}R per trade.",
         "- The direction hit rate (move from entry to the time exit) has a 95% interval entirely above 50% in "
         f"{hit_sig} of {n_v} versions.",
-        f"- Cumulative across batches 1 to 3: **{tried}** versions tried, **{elig}** eligible. Some pass by luck.", "",
+        (f"- Smoke: {n_v} versions only; the full run has 18; cumulative across batches 1 to 3 in the full run: "
+         f"**{PRIOR_TRIED + 18}** versions tried, **{PRIOR_ELIGIBLE + 18}** eligible."
+         if smoke else
+         f"- Cumulative across batches 1 to 3: **{tried}** versions tried, **{elig}** eligible. Some pass by luck."), "",
     ]
     L += ["### Selection outcome", ""]
     if sel:
@@ -695,23 +724,28 @@ def build_chronos_results(
           + ", ".join(f"{k}: {int(v)}" for k, v in counts.items()) + ".", ""]
     L += ["### All versions", ""]
     t = table.sort_values("expectancy_R", ascending=False, na_position="last")
-    rows = [{
+    perf = [{
         "version": r["name"], "n": int(r["n"]), "win%": pct(r["win_rate"]), "break-even win%": pct(r["breakeven_wr"]),
         "exp R": f(r["expectancy_R"]), "95% CI": research._ci(r["ci95_low"], r["ci95_high"]),
+        "total R": f(r["total_R"], 1), "PF": f(r["profit_factor"], 2), "max DD R": f(r["max_dd_R"], 1),
+        "trades/mo": f(r["trades_per_month"], 1), "losing streak": f(r["max_losing_streak"], 0),
+        "cost % of stop": pct(r["mean_cost_over_sl"]),
         **{str(y): f(r[f"exp_{y}"]) for y in research.SELECT_YEARS},
-        "beat coin": pct(r["beat_share"]), "overnight exp R": f(r["overnight_exp"]),
-        "overnight n": int(r["overnight_n"]), "hit rate": pct(r["hit_rate"]),
+    } for _, r in t.iterrows()]
+    riv = [{
+        "version": r["name"], "n": int(r["n"]), "beat coin": pct(r["beat_share"]),
+        "overnight exp R": f(r["overnight_exp"]), "overnight n": int(r["overnight_n"]), "hit rate": pct(r["hit_rate"]),
         "hit 95% CI": "—" if pd.isna(r["hit_lo"]) else f"[{pct(r['hit_lo'])}, {pct(r['hit_hi'])}]",
-        "losing streak": f(r["max_losing_streak"], 0), "cost % of stop": pct(r["mean_cost_over_sl"]),
         "fails": r["fail"] or "pass",
     } for _, r in t.iterrows()]
-    L += [md(rows), "",
+    L += ["Performance (R, net of costs and swap):", "", md(perf), "", "Rivals and hit rate:", "", md(riv), "",
           "Expectancy per year by signal date (2022 is a partial year). Break-even win rate comes from the version's own "
           "average win and loss. Hit rate: share of traded days where the forecast direction matched the sign of the "
           "raw move from entry to the time exit, with a Wilson 95% interval, against 50%.", ""]
     L += ["### Cost sensitivity", ""]
     L += [md(sens.to_dict("records")) if len(sens) else "_none_", "",
-          "Top 3 versions by expectancy at total cost 0.50 and 0.75 (spread floor + 0.05 slippage).", ""]
+          "Top 3 versions by expectancy at total cost 0.50 and 0.75 (spread floor + 0.05 slippage); the other "
+          "versions are not re-run at these costs.", ""]
     L += ["### Equity of the best version", ""]
     if best is not None and best["name"] in trades:
         _equity_chart(trades[best["name"]], best["name"], out_dir)
@@ -728,8 +762,12 @@ def build_chronos_results(
           f"- Warm-up days (fewer than {config.CHRONOS_CONTEXT} closed H1 bars before the day): **{warmup_n}**.",
           "- Days with no trade by reason (day table): "
           + (", ".join(f"{k}: {int(v)}" for k, v in reasons.items()) if len(reasons) else "none") + ".",
-          "- Trades skipped inside the simulator are in the `n_skipped` column of "
-          "`data/research/08_variants.parquet`.", ""]
+          "", "Days lost per version (simulator skips by reason, exact-zero forecasts, flat-filter drops; also in "
+          "`08_variants.parquet`):", ""]
+    skip_cols = [f"skip_{x}" for x in SIM_SKIP_REASONS]
+    L += [md([{"version": r["name"], **{c[5:]: int(r[c]) for c in skip_cols},
+               "zero_forecast": int(r["n_zero_forecast"]), "flat_filter": int(r["n_flat_dropped"])}
+              for _, r in t.iterrows()]), ""]
     models = ", ".join(sorted(map(str, fc["model_id"].unique()))) if len(fc) else "—"
     revs = ", ".join(sorted(map(str, fc["revision"].unique()))) if len(fc) else "—"
     L += ["### Model", "", f"- Model: `{models}`", f"- Hugging Face revision: `{revs}`",
@@ -769,6 +807,8 @@ def run(
 ) -> None:
     """mode: 'forecasts', 'smoke' or 'full'."""
     t0 = time.time()
+    if mode == "full" and not Path(FORECAST_PATH).exists():
+        raise SystemExit("forecast cache missing: run --forecasts first")
     inp = research.load_inputs()
     h1, m1 = inp.bars["H1"], inp.bars["M1"]
     days, skipped, warm_n = dev_days(h1, m1)
@@ -807,6 +847,7 @@ def run(
         r = run_chronos_variant(v, days, fc, m1, cost, swap, True, repeats)
         res.append(r)
         _log(f"{i + 1}/{len(grid)} {v.name}: n={r['n']}", t0)
+    assert_dev_only_chronos(pd.concat([r["trades"] for r in res], ignore_index=True), fc)
     table = results_table(res)
     sens = cost_sensitivity(table, days, fc, m1, inp)
     table.to_parquet(data_dir / "08_variants.parquet", index=False)
