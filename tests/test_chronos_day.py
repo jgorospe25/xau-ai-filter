@@ -190,6 +190,7 @@ def test_simulate_days_skips_sl_behind_fill():
 
 # ---- Task 3: forecasts -------------------------------------------------------------------------
 
+import json
 import sys
 
 from xauai import chronos_day as cd, config
@@ -353,3 +354,66 @@ def test_hit_rate_uses_move_to_time_exit() -> None:
     })
     # day 1: 100 -> 105 up (hit, even though price dipped to 90 first); day 2: 100 -> 95 down (miss)
     assert cd.hit_rate(days, m1) == 0.5
+
+
+# ---- Task 6: runner and report -----------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def _env(tmp_path, monkeypatch):
+    rdir, ddir = tmp_path / "reports", tmp_path / "data_research"
+    rdir.mkdir()
+    ddir.mkdir()
+    pre = ("# pre\r\nbytes\n" + cd.MARKER).encode()
+    (rdir / cd.REPORT_NAME).write_bytes(pre + b"\nold results\r\n")
+    inp = SimpleNamespace(
+        bars={"H1": _bars("2024-01-01", "2024-04-01", "1h"), "M1": _bars("2024-01-01", "2024-04-01", "1min")},
+        info={"swap_mode": 1, "swap_long": -5.0, "swap_short": -5.0, "point": 0.01, "swap_rollover3days": 3},
+    )
+    monkeypatch.setattr(config, "REPORTS_DIR", rdir)
+    monkeypatch.setattr(config, "DEV_START", "2024-01-08")
+    monkeypatch.setattr(config, "DEV_END", "2024-03-15")
+    monkeypatch.setattr(cd, "RESEARCH_DATA_DIR", ddir)
+    monkeypatch.setattr(cd, "FORECAST_PATH", ddir / "08_forecasts.parquet")
+    monkeypatch.setattr(cd.research, "load_inputs", lambda: inp)
+    return rdir, ddir, pre
+
+
+def test_smoke_writes_only_smoke_dir(tmp_path, monkeypatch):
+    rdir, ddir, pre = _env(tmp_path, monkeypatch)
+    cd.run("smoke", FakePredictor, model_id="fake/model")
+    assert [p.name for p in rdir.iterdir()] == [cd.REPORT_NAME]
+    assert (rdir / cd.REPORT_NAME).read_bytes() == pre + b"\nold results\r\n"
+    assert [p.name for p in ddir.iterdir()] == ["smoke_chronos"]
+    names = {p.name for p in (ddir / "smoke_chronos").iterdir()}
+    assert {"08_chronos_smoke.md", "08_equity.png", "08_variants.parquet", "08_selected.json"} <= names
+    t = pd.read_parquet(ddir / "smoke_chronos" / "08_variants.parquet")
+    assert set(t["name"]) == set(cd.SMOKE_VARIANTS)
+    assert json.loads((ddir / "smoke_chronos" / "08_selected.json").read_text())["smoke"] is True
+    assert b"SMOKE RUN" in (ddir / "smoke_chronos" / "08_chronos_smoke.md").read_bytes()
+
+
+def test_full_requires_forecast_cache(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit, match="--forecasts"):
+        cd.run("full", FakePredictor, model_id="fake/model")
+
+
+def test_forecasts_dev_days_only_and_full_report_keeps_bytes(tmp_path, monkeypatch):
+    rdir, ddir, pre = _env(tmp_path, monkeypatch)
+    cd.run("forecasts", FakePredictor, model_id="fake/model")
+    fc = pd.read_parquet(ddir / "08_forecasts.parquet")
+    assert len(fc) > 0 and max(fc["day"]) <= pd.Timestamp("2024-03-15").date()
+    cd.run("full", FakePredictor, model_id="fake/model")
+    got = (rdir / cd.REPORT_NAME).read_bytes()
+    assert got.startswith(pre) and got.count(cd.MARKER.encode()) == 1 and b"old results" not in got
+    text = got.decode()
+    for h in ("### In plain words", "### Selection outcome", "### All versions", "### Cost sensitivity",
+              "### Caveats", "## Test set (Part C)", "370", "154", "rarely sits exactly at break-even"):
+        assert h in text, h
+    assert text.count("| m") >= 18
+    assert (rdir / "08_equity.png").exists()
+    sel = json.loads((ddir / "08_selected.json").read_text())
+    assert sel["smoke"] is False and sel["selected"] == []
+    assert len(pd.read_parquet(ddir / "08_variants.parquet")) == 18
