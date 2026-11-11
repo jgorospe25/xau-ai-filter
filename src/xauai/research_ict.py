@@ -743,7 +743,7 @@ def build_ict_results(
 
     L += ["### Results by session and by Philippine time", "",
           f"For each model's `{BASE_SUFFIX[1:]}` variant. Session = the session the trade was filled in (asia / "
-          "london / ny, as in batch 1; a time between two sessions gets the next session to start; none only appears beyond the window table). PH band = fill time in Asia/Manila: 08-18 (day), "
+          "london / ny, as in batch 1; a time between two sessions is labelled with the next session to start). PH band = fill time in Asia/Manila: 08-18 (day), "
           "18-02 (evening), 02-08 (night). n / exp R / total R = one position at a time; the every-signal columns "
           "trade every signal.", ""]
     L += session_band_md(by_name)
