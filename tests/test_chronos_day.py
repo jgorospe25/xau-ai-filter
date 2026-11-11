@@ -192,7 +192,7 @@ def test_simulate_days_skips_sl_behind_fill():
 
 import sys
 
-from xauai import chronos_day as cd
+from xauai import chronos_day as cd, config
 
 
 class FakePredictor:
@@ -333,3 +333,10 @@ def test_select_order_and_best_only():
     out = cd.chronos_select(t)
     assert out["fail"].tolist() == ["years", "", "overnight"]
     assert out["selected"].tolist() == [False, True, False]
+
+
+def test_preregistration_has_marker_and_no_results():
+    text = (config.REPORTS_DIR / cd.REPORT_NAME).read_text(encoding="utf-8")
+    assert text.count(cd.MARKER) == 1
+    headings = [ln.lstrip("#").strip().lower() for ln in text.splitlines() if ln.startswith("#")]
+    assert not any(h.startswith("results") for h in headings)
