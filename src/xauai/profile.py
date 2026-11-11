@@ -34,7 +34,7 @@ def volume_profile(m1: pd.DataFrame, bin_size: float = config.VP_BIN, va: float 
     diff = np.zeros(size)
     np.add.at(diff, lo - base, per_bin)
     np.add.at(diff, hi - base + 1, -per_bin)
-    hist = np.cumsum(diff)[:-1]
+    hist = np.round(np.maximum(np.cumsum(diff)[:-1], 0.0), 9)  # drop cumsum float noise
     total = hist.sum()
     if total <= 0:
         return None
@@ -43,11 +43,12 @@ def volume_profile(m1: pd.DataFrame, bin_size: float = config.VP_BIN, va: float 
     acc = hist[poc]
     n = len(hist)
     while acc < va * total - 1e-9:
-        down = hist[lo_i - 1] if lo_i > 0 else -1.0
-        up = hist[hi_i + 1] if hi_i < n - 1 else -1.0
-        if down < 0 and up < 0:
+        can_down, can_up = lo_i > 0, hi_i < n - 1
+        if not (can_down or can_up):
             break
-        if up >= down:  # tie -> upper
+        down = hist[lo_i - 1] if can_down else 0.0
+        up = hist[hi_i + 1] if can_up else 0.0
+        if can_up and (not can_down or up >= down):  # tie -> upper
             hi_i += 1
             acc += up
         else:

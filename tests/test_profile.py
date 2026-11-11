@@ -39,3 +39,24 @@ def test_profile_value_area_tie_goes_upper() -> None:
     df["tick_volume"] = [10, 3, 3]
     p = volume_profile(df, bin_size=0.5, va=0.70)  # total 16, target 11.2: 10 -> 13 (upper) done
     assert p == Profile(poc=pytest.approx(100.25), vah=pytest.approx(100.75), val=pytest.approx(100.25))
+
+
+def test_profile_value_area_crosses_empty_gap_bins() -> None:
+    # bins 200-202 get 1/3 each from bar 1; bin 200 +10 (bar 2); bin 210 gets 6 (bar 3). Total 17, target 11.9.
+    # 200 = 10.333, 201 = 202 = 0.333, 203..209 = 0 (empty gap), 210 = 6. Growth must walk the gap
+    # (ties between empty bins go upper) until it reaches bin 210: VAL = 100.25, VAH = 105.25.
+    rows = [(100.0, 101.0, 100.0, 100.5), (100.0, 100.2, 100.0, 100.1), (105.0, 105.2, 105.0, 105.1)]
+    df = make_bars(rows, "2024-01-02", "1min")
+    df["tick_volume"] = [1, 10, 6]
+    p = volume_profile(df, bin_size=0.5, va=0.70)
+    assert p == Profile(poc=pytest.approx(100.25), vah=pytest.approx(105.25), val=pytest.approx(100.25))
+
+
+def test_profile_value_area_when_one_side_exhausted() -> None:
+    # POC is the lowest bin (200, vol 10), bin 202 has 5, bin 201 is empty. Total 15, target 10.5.
+    # Down side is exhausted at the histogram edge; growth must continue upward through the gap.
+    rows = [(100.0, 100.2, 100.0, 100.1), (101.0, 101.2, 101.0, 101.1)]
+    df = make_bars(rows, "2024-01-02", "1min")
+    df["tick_volume"] = [10, 5]
+    p = volume_profile(df, bin_size=0.5, va=0.70)
+    assert p == Profile(poc=pytest.approx(100.25), vah=pytest.approx(101.25), val=pytest.approx(100.25))

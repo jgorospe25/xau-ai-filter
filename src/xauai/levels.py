@@ -100,11 +100,14 @@ def merge_levels(levels: pd.DataFrame, ref_price: float, h1_atr: float, merge: f
     """Cluster levels per side of `ref_price` (>= ref counts as above); gap > merge*atr starts a new cluster.
 
     Price = outer edge (cluster max above, min below); `kinds` comma-joined in price order.
-    Levels are grouped by (valid_from, valid_to) so a multi-refresh table can be passed.
+    `levels` must hold ONE refresh only (a single valid_from/valid_to), since one ref_price and
+    h1_atr are used; more than one refresh raises ValueError. Merge a table refresh by refresh.
     """
     cols = ["side", "price", "kinds", "valid_from", "valid_to"]
     if levels.empty:
         return pd.DataFrame(columns=cols)
+    if len(levels.drop_duplicates(["valid_from", "valid_to"])) > 1:
+        raise ValueError("merge_levels takes the levels of a single refresh (one valid_from/valid_to)")
     out = []
     for (vf, vt), g in levels.groupby(["valid_from", "valid_to"], dropna=False, sort=True):
         for side in (1, -1):

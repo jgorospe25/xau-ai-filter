@@ -116,3 +116,49 @@ def test_merge_takes_outer_edge_per_side() -> None:
 def test_merge_level_equal_to_ref_is_above() -> None:
     lv = pd.DataFrame({"valid_from": T("2024-01-02"), "valid_to": pd.NaT, "kind": ["pdh"], "price": [99.0]})
     assert list(merge_levels(lv, 99.0, 1.0)["side"]) == [1]
+
+
+def test_swing_not_yet_known_at_valid_from_is_excluded() -> None:
+    b = _bars(_d1([101, 102, 103]), 3)
+    m1, m30 = b["M1"], b["M30"]
+    m1.loc[m1["time"] == T("2024-01-02 11:40"), "high"] = 105.0
+    m30.loc[m30["time"] == T("2024-01-02 11:30"), "high"] = 104.0  # swing high, known_at 13:00
+    # second session starts 12:00 (< 13:00): the swing is unknown then -> fall back to psh
+    w = pd.DataFrame({"session": "X", "start": [T("2024-01-02 10:00"), T("2024-01-02 12:00")],
+                      "end": [T("2024-01-02 12:00"), T("2024-01-02 12:30")]})
+    tab = level_table(b, w)
+    assert _get(tab, "2024-01-02 12:00", "swh") == 105.0  # fallback, not 104.0
+
+
+def test_volume_profile_range_excludes_bars_outside_anchor_range() -> None:
+    b = _bars(_d1([101, 102, 103]), 3)
+    m1, m30 = b["M1"], b["M30"]
+    m30.loc[m30["time"] == T("2024-01-02 10:30"), "high"] = 104.0  # swing high anchor 10:30
+    m30.loc[m30["time"] == T("2024-01-02 11:00"), "low"] = 96.0  # swing low anchor 11:00, known 12:30
+    # range = [10:30, 11:30). Poison M1 outside it (before, and after the later anchor's bar end).
+    out = ((m1["time"] >= T("2024-01-02 10:00")) & (m1["time"] < T("2024-01-02 10:30"))) | (
+        (m1["time"] >= T("2024-01-02 11:30")) & (m1["time"] < T("2024-01-02 13:00"))
+    )
+    m1.loc[out, ["high", "low", "tick_volume"]] = [110.0, 109.5, 1000]
+    w = _windows("2024-01-02 10:00", "2024-01-02 13:00")
+    tab = level_table(b, w)
+    vf = "2024-01-02 13:00"
+    assert (_get(tab, vf, "swh"), _get(tab, vf, "swl")) == (104.0, 96.0)
+    # inside range every M1 bar is [99.5, 100.5] -> bins 199,200,201 equal; POC tie -> lowest (99.75);
+    # 70% needs all three bins -> VAL 99.75, VAH 100.75
+    assert _get(tab, vf, "poc") == pytest.approx(99.75)
+    assert _get(tab, vf, "val") == pytest.approx(99.75)
+    assert _get(tab, vf, "vah") == pytest.approx(100.75)
+
+
+def test_merge_rejects_multiple_refreshes() -> None:
+    lv = pd.DataFrame(
+        {
+            "valid_from": [T("2024-01-02"), T("2024-01-03")],
+            "valid_to": [T("2024-01-03"), pd.NaT],
+            "kind": ["pdh", "pdh"],
+            "price": [100.0, 101.0],
+        }
+    )
+    with pytest.raises(ValueError):
+        merge_levels(lv, 99.0, 1.0)
