@@ -12,7 +12,7 @@ import pytest
 from conftest import make_bars
 
 from xauai.setups import ZONE_COLS
-from xauai.setups_ict import displacement, model1, model3
+from xauai.setups_ict import asian_boxes, displacement, model1, model3, model5
 from xauai.sim import LIMIT_SIGNAL_COLS
 
 START = "2024-01-02 00:00"
@@ -218,3 +218,152 @@ def test_model3_ote_overlap():
     assert m3["limit_price"].iloc[0] == pytest.approx(99.5)
     assert inside["setup"].tolist() == ["m1"]  # input not modified
     assert model3(below).empty
+
+
+def test_model1_sl_equal_limit_no_signal():
+    # The failed-break bar 25 is also bar 3 of the FVG (low[23]=104 > high[25]=103.0), so limit == SL == 103.0.
+    rows = FULL[:3] + [
+        (106.0, 107.0, 104.0, 105.0),  # 23
+        (105.0, 105.5, 102.0, 103.0),  # 24
+        (102.5, 103.0, 98.6, 98.8),  # 25 failed break, tip 103.0, bearish displacement (range 4.4)
+        (98.8, 102.5, 97.0, 97.5),  # 26 MSS (close < 98.5); high 102.5 >= low[24] so no newer gap
+    ]
+    assert model1(bars(rows), "M5", zones((103, 1))).empty
+
+
+# --- Asian box and Model 5 ---------------------------------------------------------------------
+
+def m1_bars(rows):
+    """rows: (time, high, low) -> M1 frame."""
+    t = pd.to_datetime([r[0] for r in rows])
+    return pd.DataFrame({"time": t, "open": 1.0, "high": [r[1] for r in rows], "low": [r[2] for r in rows],
+                         "close": 1.0, "tick_volume": 1, "spread": 0})
+
+
+# Winter: 20:00 NY = 03:00 server (next day), 00:00 NY = 07:00 server.
+BOX_M1 = [
+    ("2024-01-02 03:00", 99.0, 93.0),
+    ("2024-01-02 05:30", 100.0, 92.0),
+    ("2024-01-02 06:59", 98.0, 90.0),
+    ("2024-01-02 07:00", 200.0, 1.0),  # outside the window (end is exclusive)
+]
+
+
+def test_asian_box_known_only_at_ny_midnight():
+    box = asian_boxes(m1_bars(BOX_M1))
+    assert list(box.columns) == ["box_start", "known_at", "valid_to", "high", "low"]
+    assert len(box) == 1
+    b = box.iloc[0]
+    assert b["box_start"] == pd.Timestamp("2024-01-02 03:00")
+    assert b["known_at"] == pd.Timestamp("2024-01-02 07:00")
+    assert b["high"] == 100.0 and b["low"] == 90.0
+    # a bar before known_at sees no box
+    entry = make_bars([(95, 101, 94, 95)] * 30, "2024-01-02 04:00", "5min")
+    assert model5(entry, "M5", box).empty
+    assert entry["time"].iloc[0] < b["known_at"]
+
+
+def test_asian_box_replaced_at_next_asia():
+    rows = BOX_M1[:3] + [("2024-01-03 03:30", 105.0, 101.0)]
+    box = asian_boxes(m1_bars(rows))
+    assert len(box) == 2
+    assert box["valid_to"].iloc[0] == pd.Timestamp("2024-01-03 03:00")
+    assert box["box_start"].iloc[1] == pd.Timestamp("2024-01-03 03:00")
+    assert box["high"].iloc[1] == 105.0
+
+
+def test_sunday_evening_box_exists():
+    # Sunday 2024-01-07 20:00 NY = Monday 03:00 server
+    box = asian_boxes(m1_bars([("2024-01-08 03:10", 100.0, 99.0), ("2024-01-08 06:50", 101.0, 98.0)]))
+    assert len(box) == 1
+    assert box["known_at"].iloc[0] == pd.Timestamp("2024-01-08 07:00")
+    assert box["high"].iloc[0] == 101.0 and box["low"].iloc[0] == 98.0
+
+
+def test_box_without_bars_dropped():
+    box = asian_boxes(m1_bars(BOX_M1[:3] + [("2024-01-04 03:30", 105.0, 101.0)]))
+    assert len(box) == 2  # the 2024-01-03 window has no bars
+    assert box["box_start"].tolist() == [pd.Timestamp("2024-01-02 03:00"), pd.Timestamp("2024-01-04 03:00")]
+
+
+M5_START = "2024-01-02 05:00"  # 24 warm-up bars (05:00 .. 06:55), box known at bar 24 (07:00)
+M5_WARM = [(95.0, 96.0, 94.0, 95.0)] * 24
+M5_FLAT = (95.0, 96.0, 94.0, 95.0)
+
+
+def m5_bars(rows, tail=10):
+    return make_bars(M5_WARM + list(rows) + [M5_FLAT] * tail, M5_START, "5min")
+
+
+def M(i: int) -> pd.Timestamp:
+    return pd.Timestamp(M5_START) + pd.Timedelta(minutes=5 * i)
+
+
+BOX = asian_boxes(m1_bars(BOX_M1))  # high 100, low 90
+
+# Sell: breakout bar 24 (high 101, close above), failure bar 25 (close back below 100), retest bar 27.
+M5_SELL = [
+    (98.0, 101.0, 97.0, 100.8),  # 24 breakout start b
+    (100.8, 101.5, 99.0, 99.2),  # 25 failure f (close < B)
+    (99.2, 99.5, 98.0, 98.5),  # 26 no retest (high 99.5 < 99.8)
+    (98.5, 100.0, 98.4, 99.0),  # 27 retest: high >= B - tol, close < B
+]
+
+
+def test_model5_sell_failed_breakout_retest():
+    sig = model5(m5_bars(M5_SELL), "M5", BOX)
+    assert list(sig.columns) == list(model5(m5_bars([]), "M5", BOX).columns)
+    assert len(sig) == 1
+    r = sig.iloc[0]
+    assert r["direction"] == -1
+    assert r["setup"] == "m5"
+    assert r["entry_tf"] == "M5"
+    assert r["signal_time"] == M(27)
+    assert r["entry_time"] == M(28)
+    assert r["sl"] == pytest.approx(101.5)
+    assert r["level_kind"] == "asia_high"
+    assert r["level_price"] == pytest.approx(100.0)
+    assert r["ref_time"] == pd.Timestamp("2024-01-02 07:00")
+    assert pd.isna(r["target_owner"])
+
+
+def test_model5_close_below_box_low_cancels():
+    rows = [
+        (98.0, 101.0, 97.0, 100.8),  # 24 b
+        (100.8, 101.0, 85.0, 89.0),  # 25 closes below L=90 -> cancel
+        (89.0, 99.0, 88.0, 98.0),  # 26
+        (98.0, 100.0, 97.0, 99.0),  # 27 would be a retest if f had been set
+    ]
+    assert model5(m5_bars(rows), "M5", BOX).empty
+
+
+def test_model5_no_close_back_within_k_no_signal():
+    stay = (100.8, 101.0, 100.5, 100.8)
+    late = [(98.0, 101.0, 97.0, 100.8)] + [stay] * 12 + [(100.8, 100.9, 98.0, 99.0)] + [(99.0, 100.0, 98.5, 99.0)]
+    assert model5(m5_bars(late), "M5", BOX).empty  # first close below B at b + 13
+    edge = [(98.0, 101.0, 97.0, 100.8)] + [stay] * 11 + [(100.8, 100.9, 98.0, 99.0)] + [(99.0, 100.0, 98.5, 99.0)]
+    assert len(model5(m5_bars(edge), "M5", BOX)) == 1  # f at b + 12, retest right after
+
+
+def test_model5_retest_after_k_no_signal():
+    away = (98.0, 98.5, 97.0, 97.5)
+    ok = M5_SELL[:2] + [away] * 11 + [(98.0, 100.0, 97.5, 99.0)]  # r = f + 12
+    assert len(model5(m5_bars(ok), "M5", BOX)) == 1
+    late = M5_SELL[:2] + [away] * 12 + [(98.0, 100.0, 97.5, 99.0)]  # r = f + 13
+    assert model5(m5_bars(late), "M5", BOX).empty
+
+
+def test_model5_buy_mirror():
+    box = asian_boxes(m1_bars([(t, 200 - lo, 200 - hi) for t, hi, lo in BOX_M1[:3]]))  # [100, 110]
+    warm = [(105.0, 106.0, 104.0, 105.0)] * 24
+    rows = mirror(M5_SELL)
+    entry = make_bars(warm + rows + [(105.0, 106.0, 104.0, 105.0)] * 10, M5_START, "5min")
+    sig = model5(entry, "M5", box)
+    assert len(sig) == 1
+    r = sig.iloc[0]
+    assert r["direction"] == 1
+    assert r["signal_time"] == M(27)
+    assert r["entry_time"] == M(28)
+    assert r["sl"] == pytest.approx(98.5)
+    assert r["level_kind"] == "asia_low"
+    assert r["level_price"] == pytest.approx(100.0)

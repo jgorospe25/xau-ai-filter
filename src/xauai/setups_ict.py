@@ -1,4 +1,5 @@
-"""ICT entry models (batch 2): Model 1 (failed break -> MSS -> FVG limit) and Model 3 (Model 1 + OTE).
+"""ICT entry models (batch 2): Model 1 (failed break -> MSS -> FVG limit), Model 3 (Model 1 + OTE)
+and Model 5 (failed breakout of the Asian-range box, retest, market entry).
 
 Written for the SELL at a zone above; buys run the same code on mirrored prices (as `setups`):
 open'/close' negated, high' = -low, low' = -high, zone price negated. Oriented prices are turned back
@@ -16,10 +17,11 @@ import pandas as pd
 
 from xauai import config
 from xauai.indicators import atr
-from xauai.setups import _last_known, _tolerance, _zone_spans
+from xauai.setups import _empty as _empty_market
+from xauai.setups import _finish, _last_known, _tolerance, _zone_spans
 from xauai.sim import LIMIT_SIGNAL_COLS
 from xauai.structure import swing_points
-from xauai.timeutil import TF_LEN
+from xauai.timeutil import TF_LEN, local_windows
 
 _ATR_N = 14
 
@@ -92,8 +94,8 @@ def _model1_zone(
         else:
             i = mss
             m = _fvg(h, low, j, i)
-            if m >= 0 and c[i] < h[m]:
-                sl = float(h[j : i + 1].max())
+            sl = float(h[j : i + 1].max())
+            if m >= 0 and c[i] < h[m] and sl > h[m]:  # sl == limit would be a zero-risk order
                 leg = float(low[j : i + 1].min())
                 out.append({"j": j, "i": i, "m": m, "sl": sl, "leg_end": leg})
             resume = i + 1
@@ -200,3 +202,110 @@ def _empty() -> pd.DataFrame:
     out["direction"] = out["direction"].astype(int)
     out["ote_overlap"] = out["ote_overlap"].astype(bool)
     return out
+
+
+# --- Asian-range box and Model 5 -----------------------------------------------------------------
+
+BOX_COLS = ["box_start", "known_at", "valid_to", "high", "low"]
+
+
+def asian_boxes(m1: pd.DataFrame) -> pd.DataFrame:
+    """Asian-range boxes from M1 bars: one per `config.ASIA_BOX` window that has bars.
+
+    high / low over M1 bars with start <= time < end; known_at = window end (NY midnight);
+    valid_to = start of the next window. Windows without M1 bars are dropped.
+    """
+    t = m1["time"].to_numpy()
+    if len(t) == 0:
+        out = pd.DataFrame({c: pd.Series(dtype=float) for c in BOX_COLS})
+        for col in BOX_COLS[:3]:
+            out[col] = pd.to_datetime(out[col])
+        return out
+    first, last = pd.Timestamp(t[0]).normalize(), pd.Timestamp(t[-1]).normalize()
+    w = local_windows(str((first - pd.Timedelta(days=2)).date()), str((last + pd.Timedelta(days=2)).date()), *config.ASIA_BOX)
+    starts, ends = w["start"].to_numpy(), w["end"].to_numpy()
+    hi, lo = m1["high"].to_numpy(dtype=float), m1["low"].to_numpy(dtype=float)
+    lo_i = np.searchsorted(t, starts, side="left")
+    hi_i = np.searchsorted(t, ends, side="left")
+    rows = []
+    for k in range(len(w) - 1):  # the last window has no successor -> no valid_to
+        a, b = int(lo_i[k]), int(hi_i[k])
+        if b > a:
+            rows.append((starts[k], ends[k], starts[k + 1], float(hi[a:b].max()), float(lo[a:b].min())))
+    out = pd.DataFrame(rows, columns=BOX_COLS)
+    for col in BOX_COLS[:3]:
+        out[col] = pd.to_datetime(out[col])
+    return out
+
+
+def _model5_box(
+    h: np.ndarray, c: np.ndarray, tol: np.ndarray, big_b: float, big_l: float, a: int, end: int, k: int
+) -> list[tuple[int, int]]:
+    """Model 5 at one box (sell orientation: B = box high, L = box low) over bars [a, end).
+    Returns (retest r, breakout start b)."""
+    out: list[tuple[int, int]] = []
+    i = a
+    while i < end:
+        if not (h[i] > big_b and (i == a or c[i - 1] <= big_b)):
+            i += 1
+            continue
+        b = i
+        f = -1
+        last = min(b + k, end - 1)
+        q = b
+        while q <= last:
+            if c[q] < big_l:
+                break  # cancelled
+            if c[q] < big_b:
+                f = q
+                break
+            q += 1
+        if f < 0:
+            i = q + 1  # cancelled, or no close back inside within K
+            continue
+        last = min(f + k, end - 1)
+        r = -1
+        q = f + 1
+        while q <= last:
+            if c[q] > big_b or c[q] < big_l:
+                break  # cancelled
+            if h[q] >= big_b - tol[q] and c[q] < big_b:
+                r = q
+                break
+            q += 1
+        if r >= 0:
+            out.append((r, b))
+        i = q + 1  # after the signal, the cancel or the expiry
+    return out
+
+
+def model5(entry: pd.DataFrame, tf: str, boxes: pd.DataFrame) -> pd.DataFrame:
+    """Model 5 market-entry signals (both directions): failed breakout of an Asian box edge, close
+    back inside within K bars, retest of the edge, entry at the next bar open. SL = extreme of
+    [breakout start, retest]. Everything happens inside one box's span (known_at .. valid_to)."""
+    entry = entry.reset_index(drop=True)
+    if len(entry) == 0 or boxes.empty:
+        return _empty_market()
+    t = entry["time"].to_numpy()
+    close_t = (entry["time"] + TF_LEN[tf]).to_numpy()
+    tol = _tolerance(entry)
+    a_all = np.searchsorted(t, boxes["known_at"].to_numpy(), side="left")
+    e_all = np.searchsorted(close_t, boxes["valid_to"].to_numpy(), side="right")
+    k = config.RETEST_BARS
+    cands: list[dict] = []
+    for d, kind, edge, far in ((-1, "asia_high", "high", "low"), (1, "asia_low", "low", "high")):
+        _, h, _, c = _oriented4(entry, d)
+        for bi in range(len(boxes)):
+            a, end = int(a_all[bi]), int(e_all[bi])
+            if a >= end:
+                continue
+            bx = boxes.iloc[bi]
+            big_b, big_l = -d * float(bx[edge]), -d * float(bx[far])
+            for r, b in _model5_box(h, c, tol, big_b, big_l, a, end, k):
+                cands.append(
+                    {
+                        "r": r, "direction": d, "sl": -d * float(h[b : r + 1].max()), "level_kind": kind,
+                        "level_price": float(bx[edge]), "ref_time": bx["known_at"], "target_owner": np.nan,
+                    }
+                )
+    return _finish(cands, entry, tf, "m5")
