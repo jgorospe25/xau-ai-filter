@@ -144,13 +144,19 @@ def _sweep_retest(
     return out
 
 
-def setup1(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame) -> pd.DataFrame:
-    """Setup 1 signals (both directions) on entry-TF bars: sweep, close back inside, retest within K."""
+def setup1(
+    entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame, zones: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Setup 1 signals (both directions) on entry-TF bars: sweep, close back inside, retest within K.
+
+    `zones` = precomputed `live_zones(levels, entry, _h1_atr_series(h1), tf)` (reuse across setups).
+    """
     entry = entry.reset_index(drop=True)
     t = entry["time"].to_numpy()
     close_t = (entry["time"] + TF_LEN[tf]).to_numpy()
     tol = _tolerance(entry)
-    zones = live_zones(levels, entry, _h1_atr_series(h1), tf)
+    if zones is None:
+        zones = live_zones(levels, entry, _h1_atr_series(h1), tf)
     a, end = _zone_spans(zones, t, close_t)
     cands: list[dict] = []
     for d, side in ((-1, 1), (1, -1)):
@@ -277,12 +283,16 @@ def _owner_target(
     return -d * (float(known[ok].min()) if ok.any() else pdl)
 
 
-def setup3(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame, d1: pd.DataFrame) -> pd.DataFrame:
+def setup3(
+    entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame, d1: pd.DataFrame,
+    zones: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Setup 3 signals (both directions): touch a zone, lower high, break the last swing low, retest.
 
     target_owner = PDL (sell) / PDH (buy) from the `levels` rows valid at signal_time, or, if any,
     the unswept known entry-TF swing low/high between it and the signal close nearest the PDL/PDH. `d1` is accepted for the
     interface; the PDL/PDH come from the level table (same D1 data, already no-lookahead).
+    `zones` = optional precomputed `live_zones` (as in setup1).
     """
     del d1
     entry = entry.reset_index(drop=True)
@@ -290,7 +300,8 @@ def setup3(entry: pd.DataFrame, tf: str, levels: pd.DataFrame, h1: pd.DataFrame,
     close_t = (entry["time"] + TF_LEN[tf]).to_numpy()
     n = len(t)
     tol = _tolerance(entry)
-    zones = live_zones(levels, entry, _h1_atr_series(h1), tf)
+    if zones is None:
+        zones = live_zones(levels, entry, _h1_atr_series(h1), tf)
     a, end = _zone_spans(zones, t, close_t)
     cands: list[dict] = []
     for d, side, kind in ((-1, 1, "pdl"), (1, -1, "pdh")):
@@ -317,14 +328,25 @@ def _cand(r: int, d: int, sl: float, z: pd.Series, owner: float) -> dict:
     }
 
 
-def _finish(cands: list[dict], entry: pd.DataFrame, tf: str, setup: str) -> pd.DataFrame:
-    """One signal per bar and direction (earliest zone valid_from, then nearer SL); entry = next bar open."""
+def _finish(
+    cands: list[dict], entry: pd.DataFrame, tf: str, setup: str, trigger_tf: str | None = None
+) -> pd.DataFrame:
+    """One signal per bar and direction (earliest zone valid_from, then nearer SL).
+
+    `r` indexes `entry` (the signal bar). Entry = next bar open unless a candidate carries its own
+    `entry_time`; `target_ob` / `target_fvg` are taken from the candidates when present.
+    """
     if not cands:
         return _empty()
     t = entry["time"].to_numpy()
     c = entry["close"].to_numpy(dtype=float)
     x = pd.DataFrame(cands)
-    x = x[x["r"] + 1 < len(t)]
+    if "entry_time" not in x.columns:
+        x = x[x["r"] + 1 < len(t)].copy()
+        x["entry_time"] = t[x["r"].to_numpy() + 1]
+    for col in ("target_ob", "target_fvg"):
+        if col not in x.columns:
+            x[col] = np.nan
     if x.empty:
         return _empty()
     x["_dist"] = (x["sl"] - c[x["r"].to_numpy()]).abs()
@@ -334,17 +356,17 @@ def _finish(cands: list[dict], entry: pd.DataFrame, tf: str, setup: str) -> pd.D
     out = pd.DataFrame(
         {
             "signal_time": pd.to_datetime(t[r]),
-            "entry_time": pd.to_datetime(t[r + 1]),
+            "entry_time": pd.to_datetime(x["entry_time"].to_numpy()),
             "direction": x["direction"].to_numpy(dtype=int),
             "sl": x["sl"].to_numpy(dtype=float),
             "setup": setup,
             "entry_tf": tf,
-            "trigger_tf": None,
+            "trigger_tf": trigger_tf,
             "level_kind": x["level_kind"].to_numpy(),
             "level_price": x["level_price"].to_numpy(dtype=float),
             "ref_time": pd.to_datetime(x["ref_time"].to_numpy()),
-            "target_ob": np.nan,
-            "target_fvg": np.nan,
+            "target_ob": x["target_ob"].to_numpy(dtype=float),
+            "target_fvg": x["target_fvg"].to_numpy(dtype=float),
             "target_owner": x["target_owner"].to_numpy(dtype=float),
         }
     )
