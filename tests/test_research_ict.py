@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from conftest import make_bars
 
 from xauai import config, research, research_ict
@@ -295,3 +296,183 @@ def test_run_ict_limit_all_skipped_before_placement() -> None:
     out, sk = run_ict_detail(IctVariant("m1", "M5", "rr2.0", False, "none", True), inp, config.DEV_START, config.DEV_END)
     assert len(out) == 0 and sk == {"entry_after_friday_close": 1}
     assert {"offset_atr", "taken", "variant"} <= set(out.columns)
+
+
+# --- Task 7: report builder and runner -----------------------------------------------------------
+def _trades(model: str, n: int = 8, r: float = 0.5, start: str = "2022-06-01", every: str = "45D") -> pd.DataFrame:
+    """Synthetic simulated trades (all taken) spread over the development period."""
+    t = pd.date_range(start, periods=n, freq=every) + pd.Timedelta(hours=10)
+    i = np.arange(n)
+    d = np.where(i % 2 == 0, 1, -1)
+    return pd.DataFrame(
+        {
+            "signal_time": t - pd.Timedelta(minutes=5), "entry_time": t, "exit_time": t + pd.Timedelta(hours=2),
+            "direction": d, "sl_dist": 2.0, "cost": 0.35, "entry": 100.0, "sl": 100.0 - d * 2.0,
+            "tp": 100.0 + d * 4.0, "r": np.where(i % 3 == 0, -1.0, r * 3), "taken": True,
+            "session": [("asia", "london", "ny")[k % 3] for k in i], "setup": model, "entry_tf": "M5",
+            "tp_mode": "rr2.0", "offset_atr": 0.3,
+        }
+    )
+
+
+def _results(variants: list[IctVariant]) -> list:
+    out = []
+    for v in variants:
+        tr = _trades(v.model).assign(entry_tf=v.entry_tf, variant=v.name)
+        sk = {"not_filled": 3, "gap_through_sl": 1, "no_entry_bar": 2} if v.model in research_ict.LIMIT_MODELS else {}
+        out.append(research.VariantResult(v, tr, sk))
+    return out
+
+
+def _smoke_set() -> list[IctVariant]:
+    by = {v.name: v for v in ict_grid()}
+    return [by[n] for n in research_ict.SMOKE_VARIANTS]
+
+
+def test_ict_report_keeps_preregistration(tmp_path, monkeypatch) -> None:
+    rdir = tmp_path / "reports"
+    rdir.mkdir()
+    monkeypatch.setattr(config, "REPORTS_DIR", rdir)
+    pre = b"# Pre-registration\r\nmixed endings\nline\r\n\r\n" + research_ict.MARKER.encode()
+    (rdir / research_ict.REPORT_NAME).write_bytes(pre + b"\nold results\r\n")
+    results = _results(_smoke_set())
+    table = research_ict.build_ict_table(results)
+    text = research_ict.build_ict_results(results, table, tmp_path, 1.0, smoke=False)
+    assert (tmp_path / "07_equity.png").exists() and (tmp_path / "07_expectancy.png").exists()
+    # in place (the full run) and to another file (the smoke run)
+    for out in (rdir / research_ict.REPORT_NAME, tmp_path / "07_ict_smoke.md"):
+        research_ict.write_ict_report(text, out)
+        got = out.read_bytes()
+        assert got.startswith(pre) and b"old results" not in got
+        assert got.count(research_ict.MARKER.encode()) == 1
+    # a report without the marker is refused
+    (rdir / research_ict.REPORT_NAME).write_text("no marker", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        research_ict.write_ict_report(text, tmp_path / "x.md")
+
+
+def test_ict_report_states_cumulative_counts(tmp_path) -> None:
+    results = _results(ict_grid())
+    table = research_ict.build_ict_table(results)
+    assert len(table) == 144 and int(table["eligible"].sum()) == 72
+    text = research_ict.build_ict_results(results, table, tmp_path, 60.0, smoke=False)
+    assert "Variants tried: **144** (pre-registered: 144)" in text
+    assert "Eligible for selection (M5 entries): **72** (pre-registered: 72)" in text
+    assert "**352** variants (**136** eligible)" in text
+    assert "luck" in text
+    for heading in (
+        "### In plain words", "### Selection outcome per model", "### Charts", "### Top 3 eligible variants per model",
+        "### Null baseline (random entries)", "### Cost sensitivity", "### Cost as a share of the stop",
+        "### Results by session and by Philippine time", "### Model 5: Asian box height and stop size",
+        "### Models 1 and 3: fill rate and limit offset", "### Entry-timeframe comparison",
+        "### Skipped signals by reason", "### All variants", "### Caveats", "## Test set (Part C)",
+    ):
+        assert heading in text, heading
+    assert "not_filled" in text and "gap_through_sl" in text
+    assert "evening" in text.lower()
+    assert "SMOKE" not in text
+
+
+def test_ict_select_best_per_model() -> None:
+    by = {v.name: v for v in ict_grid()}
+    good = _trades("m1", n=130, r=0.5, start="2022-05-20", every="10D")
+    assert set(good["signal_time"].dt.year) >= set(research.SELECT_YEARS)
+
+    def res(name: str, r_scale: float, null: float = -0.5):
+        v = by[name]
+        tr = good.assign(r=good["r"] * r_scale, setup=v.model, entry_tf=v.entry_tf)
+        return research.VariantResult(v, tr, {}, null=np.full(20, null))
+
+    results = [
+        res("m1|M5|rr2.0|nodir|none", 1.0),
+        res("m1|M5|rr3.0|nodir|none", 2.0),  # best m1
+        res("m3|M5|rr2.0|nodir|none", 1.0, null=5.0),  # fails the null
+        res("m5|M5|rr2.0|nodir|none", 1.0),
+        res("m5|M15|rr2.0|nodir|none", 3.0),  # comparison only, never selected
+    ]
+    table = research_ict.build_ict_table(results)
+    for col in ("name", "setup", "entry_tf", "tp_mode", "direction", "time_filter", "eligible", "fail", "selected"):
+        assert col in table.columns
+    assert set(table.loc[table["selected"], "name"]) == {"m1|M5|rr3.0|nodir|none", "m5|M5|rr2.0|nodir|none"}
+    t = table.set_index("name")
+    assert t.loc["m3|M5|rr2.0|nodir|none", "fail"] == "null"
+    assert t.loc["m5|M15|rr2.0|nodir|none", "fail"] == "eligible"
+
+
+def test_ict_assert_dev_only() -> None:
+    v = IctVariant("m1", "M5", "rr2.0", False, "none", True)
+    ok = _trades("m1")
+    research.assert_dev_only([research.VariantResult(v, ok, {})])
+    leak = pd.concat([ok, ok.tail(1).assign(signal_time=pd.Timestamp("2025-10-24 00:00"))], ignore_index=True)
+    for res in (research.VariantResult(v, leak, {}), research.VariantResult(v, ok, {}, sens={0.5: leak})):
+        with pytest.raises(AssertionError):
+            research.assert_dev_only([res])
+
+
+def test_ict_fill_rate_and_offset() -> None:
+    v = IctVariant("m1", "M5", "rr2.0", False, "none", True)
+    tr = _trades("m1", n=4).assign(offset_atr=[0.1, 0.2, 0.4, 0.9])
+    sk = {"no_entry_bar": 2, "stale_after_gap": 1, "entry_after_friday_close": 1, "not_filled": 6,
+          "gap_through_sl": 1, "sl_behind_fill": 1, "target_too_close_or_passed": 1, "no_target": 1}
+    s = research_ict.fill_stats(research.VariantResult(v, tr, sk))
+    assert s["placed"] == 4 + 6 + 4 and s["filled"] == 4 + 4
+    assert s["fill_rate"] == pytest.approx(8 / 14) and s["median_offset_atr"] == pytest.approx(0.3)
+
+
+def test_ph_band() -> None:
+    t = pd.Series(pd.to_datetime([
+        "2025-10-22 05:00",  # NY summer, server = UTC+3: UTC 02:00 -> Manila 10:00
+        "2025-10-22 15:00",  # UTC 12:00 -> Manila 20:00
+        "2025-10-22 20:00",  # UTC 17:00 -> Manila 01:00
+        "2025-10-22 22:00",  # UTC 19:00 -> Manila 03:00
+        "2025-01-15 02:00",  # NY winter, server = UTC+2: UTC 00:00 -> Manila 08:00
+        "2025-01-15 01:59",  # UTC 23:59 -> Manila 07:59
+    ]))
+    assert research_ict.ph_band(t).tolist() == ["08-18", "18-02", "18-02", "02-08", "08-18", "02-08"]
+
+
+def _smoke_inputs() -> Inputs:
+    inp = _null_inputs()
+    inp.levels = pd.DataFrame(  # no levels -> next_level orders are skipped with no_target
+        {"valid_from": pd.Series(dtype="datetime64[ns]"), "valid_to": pd.Series(dtype="datetime64[ns]"),
+         "kind": pd.Series(dtype=str), "price": pd.Series(dtype=float)}
+    )
+    sig1 = pd.DataFrame(
+        [
+            limit_row(f"{DAY} 07:55", f"{DAY} 08:00", f"{DAY} 09:00", limit=99.5),
+            limit_row(f"{DAY} 10:55", f"{DAY} 11:00", f"{DAY} 12:00", limit=100.5, d=-1, sl=102.0),
+        ]
+    )[LIMIT_SIGNAL_COLS]
+    sig5 = pd.DataFrame([market_row(f"{DAY} 09:00", f"{DAY} 09:05"), market_row(f"{DAY} 13:00", f"{DAY} 13:05")])
+    for tf in ("M5", "M15"):
+        for dr in ((), ("dir",)):
+            inp.signals[("ict", "m1", tf, *dr)] = sig1.assign(entry_tf=tf)
+            inp.signals[("ict", "m3", tf, *dr)] = sig1.iloc[:0]
+            inp.signals[("ict", "m5", tf, *dr)] = sig5[SIGNAL_COLS].assign(entry_tf=tf)
+    return inp
+
+
+def test_ict_main_smoke_writes_only_smoke_dir(tmp_path, monkeypatch) -> None:
+    rdir, ddir = tmp_path / "reports", tmp_path / "data_research"
+    rdir.mkdir()
+    pre = "# pre\r\n" + research_ict.MARKER
+    (rdir / research_ict.REPORT_NAME).write_bytes((pre + "\nold\n").encode())
+    monkeypatch.setattr(config, "REPORTS_DIR", rdir)
+    monkeypatch.setattr(research_ict, "RESEARCH_DATA_DIR", ddir)
+    monkeypatch.setattr(research, "load_inputs", _smoke_inputs)
+    research_ict.main(["--smoke"])
+    assert [p.name for p in rdir.iterdir()] == [research_ict.REPORT_NAME]
+    assert (rdir / research_ict.REPORT_NAME).read_bytes() == (pre + "\nold\n").encode()
+    assert [p.name for p in ddir.iterdir()] == ["smoke_ict"]
+    smoke = ddir / "smoke_ict"
+    names = {p.name for p in smoke.iterdir()}
+    assert {"07_ict_smoke.md", "07_variants.parquet", "07_selected.json", "07_equity.png", "07_expectancy.png"} <= names
+    md = (smoke / "07_ict_smoke.md").read_bytes()
+    assert md.startswith(pre.encode()) and b"SMOKE RUN" in md
+    table = pd.read_parquet(smoke / "07_variants.parquet")
+    assert set(table["name"]) == set(research_ict.SMOKE_VARIANTS)
+
+
+def test_ict_main_final_is_task8() -> None:
+    with pytest.raises(SystemExit, match="Task 8"):
+        research_ict.main(["--final"])

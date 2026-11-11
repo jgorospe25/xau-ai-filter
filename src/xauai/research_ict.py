@@ -16,7 +16,11 @@ whose entry_time is outside the windows).
 
 from __future__ import annotations
 
+import argparse
+import json
+import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -24,11 +28,13 @@ import pandas as pd
 from xauai import config, research
 from xauai.indicators import atr
 from xauai.labels import CostParams, SwapParams
-from xauai.research import NULL_SEED, RR_TPS, Inputs, _cut, _zones, null_candidates, null_draws
+from xauai.research import (
+    NULL_SEED, RR_TPS, Inputs, VariantResult, _ci, _cut, _f, _md, _pct, _zones, null_candidates, null_draws,
+)
 from xauai.setups_ict import asian_boxes, model1, model3, model5
 from xauai.sim import LIMIT_SIGNAL_COLS, one_order, one_position, simulate_limit_signals, simulate_signals
 from xauai.structure import htf_direction
-from xauai.timeutil import TF_LEN, time_filter_mask
+from xauai.timeutil import TF_LEN, server_to_utc, time_filter_mask
 
 MODELS: tuple[str, ...] = ("m1", "m3", "m5")
 MODEL_NAMES: dict[str, str] = {
@@ -280,3 +286,519 @@ def ict_null(
         if len(r):
             out[int(k)] = float(r.mean())
     return out
+
+
+# --- Task 7: results table, report and runner ----------------------------------------------------
+RESEARCH_DATA_DIR = config.DATA_DIR / "research"
+SMOKE_DIR = "smoke_ict"
+SMOKE_REPORT = "07_ict_smoke.md"
+SMOKE_REPEATS = 3
+SMOKE_VARIANTS: tuple[str, ...] = (
+    "m1|M5|rr2.0|nodir|none", "m3|M5|rr2.0|nodir|none", "m5|M5|rr2.0|nodir|none",
+    "m1|M5|next_level|dir|killzone", "m5|M5|rr3.0|dir|owner", "m1|M15|rr2.0|nodir|none",
+)
+BASE_SUFFIX = "|M5|rr2.0|nodir|none"  # each model's base variant for the session / PH-time / fill tables
+PLACEMENT_SKIPS: tuple[str, ...] = ("no_entry_bar", "stale_after_gap", "entry_after_friday_close")
+FILLED_SKIPS: tuple[str, ...] = ("gap_through_sl", "sl_behind_fill", "no_target", "target_too_close_or_passed")
+ICT_SKIP_REASONS: tuple[str, ...] = research.SKIP_REASONS + ("not_filled", "gap_through_sl")
+SESSION_ORDER: tuple[str, ...] = ("asia", "london", "ny", "none")
+PH_BANDS: tuple[str, ...] = ("08-18", "18-02", "02-08")  # Asia/Manila hours, [start, end)
+EVENING = "18-02"
+_MANILA = pd.Timedelta(hours=8)  # Asia/Manila = UTC+8, no DST
+COLORS = {"m1": "#2a78d6", "m3": "#1baf7a", "m5": "#eb6834"}
+TEST_NOT_RUN_TEXT = (
+    "Not run: no ICT model variant was selected in the development period. Per the pre-registration, the test "
+    "period 2025-10-24 .. 2026-10-23 stays untouched."
+)
+
+
+def ict_variant_row(res: VariantResult) -> dict:
+    """research.variant_row with the ICT variant fields (setup = model, direction, time_filter)."""
+    v = res.v
+    row = {
+        "name": v.name, "setup": v.model, "entry_tf": v.entry_tf, "tp_mode": v.tp_mode, "direction": v.direction,
+        "time_filter": v.time_filter, "eligible": v.eligible, "n_signals": len(res.trades),
+        "n_skipped": int(sum(res.skipped.values())),
+    }
+    row.update(research.flat_metrics(res.trades))
+    every = research.flat_metrics(res.trades, every=True)
+    row.update({f"all_{k}": every[k] for k in ("win_rate", "expectancy_R", "ci95_low", "ci95_high", "total_R")})
+    for c in config.SENSITIVITY_TOTAL_COSTS:
+        tr = res.sens.get(c)
+        row[f"exp_cost_{c:.2f}"] = research._exp(tr) if tr is not None else np.nan
+        row[f"all_exp_cost_{c:.2f}"] = research._exp(tr, every=True) if tr is not None else np.nan
+    if res.null is not None:
+        x = res.null[np.isfinite(res.null)]
+        row["beat_share"] = research.beat_share(row["expectancy_R"], res.null)
+        row["null_mean"], row["null_p05"], row["null_p95"] = (
+            (float(x.mean()), float(np.percentile(x, 5)), float(np.percentile(x, 95))) if len(x) else (np.nan,) * 3
+        )
+        row["null_runs"] = len(x)
+    else:
+        row.update(beat_share=np.nan, null_mean=np.nan, null_p05=np.nan, null_p95=np.nan, null_runs=0)
+    return row
+
+
+def build_ict_table(results: list[VariantResult]) -> pd.DataFrame:
+    """Per-variant metrics with `fail` / `selected` from research.selection_checks / research.select."""
+    table = research.selection_checks(pd.DataFrame([ict_variant_row(r) for r in results]))
+    chosen = set(research.select(table)["name"]) if len(table) else set()
+    table["selected"] = table["name"].isin(chosen)
+    return table
+
+
+def fill_stats(res: VariantResult) -> dict:
+    """Limit models: placed = traded + every skip except the placement skips; filled = traded + skips that happen
+    after the fill (gap_through_sl, sl_behind_fill, no_target, target_too_close_or_passed). Over every order
+    (not only one order at a time). Median offset of the limit from the signal close in ATR, over traded orders."""
+    sk, traded = res.skipped, len(res.trades)
+    placed = traded + sum(n for k, n in sk.items() if k not in PLACEMENT_SKIPS)
+    filled = traded + sum(sk.get(k, 0) for k in FILLED_SKIPS)
+    off = res.trades["offset_atr"].dropna() if "offset_atr" in res.trades.columns else pd.Series(dtype=float)
+    return {
+        "placed": placed, "filled": filled, "not_filled": sk.get("not_filled", 0),
+        "fill_rate": filled / placed if placed else np.nan,
+        "median_offset_atr": float(off.median()) if len(off) else np.nan,
+    }
+
+
+def ph_band(times: pd.Series) -> pd.Series:
+    """Philippine-time band of server times: server -> UTC (timeutil.server_to_utc) -> Asia/Manila (UTC+8);
+    "08-18" = [08, 18), "18-02" = [18, 02), "02-08" = [02, 08)."""
+    t = pd.Series(pd.to_datetime(pd.Series(times)).to_numpy())
+    h = (server_to_utc(t) + _MANILA).dt.hour.to_numpy()
+    band = np.where((h >= 8) & (h < 18), "08-18", np.where((h >= 18) | (h < 2), "18-02", "02-08"))
+    return pd.Series(band, index=pd.Series(times).index)
+
+
+def _dist_row(label: str, x: pd.Series, pct: bool = False) -> dict:
+    x = pd.Series(x, dtype=float).dropna()
+    fmt = _pct if pct else (lambda y: _f(y, 2))
+    q = np.percentile(x, [10, 50, 90]) if len(x) else (np.nan,) * 3
+    return {"quantity": label, "n": len(x), "p10": fmt(q[0]), "median": fmt(q[1]), "p90": fmt(q[2])}
+
+
+def _band_table(trades: pd.DataFrame) -> tuple[str, str]:
+    """(markdown table by session and PH band, plain-words evening sentence) for one variant's trades."""
+    one = trades[trades["taken"].astype(bool)]
+
+    def groups(t: pd.DataFrame) -> dict[str, np.ndarray]:
+        if t.empty:
+            return {}
+        out: dict[str, np.ndarray] = {}
+        sess = t["session"].fillna("none").astype(str).to_numpy()
+        band = ph_band(t["entry_time"]).to_numpy()
+        r = t["r"].to_numpy(float)
+        for s in SESSION_ORDER:
+            out[f"session {s}"] = r[sess == s]
+        for b in PH_BANDS:
+            out[f"PH {b}"] = r[band == b]
+        return out
+
+    a, b = groups(one), groups(trades)
+    order = [f"session {s}" for s in SESSION_ORDER] + [f"PH {x}" for x in PH_BANDS]
+    rows = []
+    for g in order:
+        ra, rb = a.get(g, np.array([])), b.get(g, np.array([]))
+        if not len(ra) and not len(rb):
+            continue
+        rows.append({
+            "group": g, "n": len(ra), "win%": _pct((ra > 0).mean()) if len(ra) else "—",
+            "exp R": _f(ra.mean()) if len(ra) else "—", "total R": _f(ra.sum(), 1),
+            "every signal n": len(rb), "every signal exp R": _f(rb.mean()) if len(rb) else "—",
+        })
+    if one.empty:
+        return _md(rows), "No trades, so nothing can be said about the evening."
+    ev = ph_band(one["entry_time"]).to_numpy() == EVENING
+    r = one["r"].to_numpy(float)
+    re, ro = r[ev], r[~ev]
+    if not len(re) or not len(ro):
+        return _md(rows), (f"Evening ({EVENING} Manila): {len(re)} trades, other hours: {len(ro)}; "
+                           "no comparison possible.")
+    worse = re.mean() < ro.mean()
+    sent = (f"Evening ({EVENING} Manila): {re.mean():+.3f}R per trade over {len(re)} trades, against "
+            f"{ro.mean():+.3f}R over {len(ro)} trades in the other hours, so the evening "
+            f"{'shows worse' if worse else 'does not show worse'} expectancy for this variant (one position at a "
+            "time; a gap between small groups can be luck).")
+    return _md(rows), sent
+
+
+def session_band_md(by_name: dict[str, VariantResult]) -> list[str]:
+    L = []
+    for m in MODELS:
+        name = m + BASE_SUFFIX
+        L += [f"#### {MODEL_NAMES[m]} — `{name}`", ""]
+        if name not in by_name:
+            L += ["_not run_", ""]
+            continue
+        md, sent = _band_table(by_name[name].trades)
+        L += [md, "", sent, ""]
+    return L
+
+
+def model5_md(by_name: dict[str, VariantResult], boxes: pd.DataFrame | None) -> str:
+    empty = {"n": 0, "p10": "—", "median": "—", "p90": "—"}
+    rows = []
+    if boxes is not None and len(boxes):
+        lo, hi = research._dev_bounds()
+        b = boxes[(boxes["box_start"] >= lo) & (boxes["box_start"] <= hi)]
+        rows.append(_dist_row("Asian box height, high - low ($), every box", b["high"] - b["low"]))
+    else:
+        rows.append({"quantity": "Asian box height ($): boxes not available", **empty})
+    res = by_name.get("m5" + BASE_SUFFIX)
+    if res is not None and len(res.trades):
+        t = res.trades
+        rows.append(_dist_row("stop size, fill to SL ($)", t["sl_dist"]))
+        rows.append(_dist_row("cost / stop", t["cost"] / t["sl_dist"], pct=True))
+    else:
+        rows.append({"quantity": f"stop size: `m5{BASE_SUFFIX}` has no trades", **empty})
+    return _md(rows)
+
+
+def fill_md(by_name: dict[str, VariantResult]) -> str:
+    rows = []
+    for m in LIMIT_MODELS:
+        for tfm in TIME_MODES:
+            name = f"{m}|M5|rr2.0|nodir|{tfm}"
+            if name not in by_name:
+                continue
+            s = fill_stats(by_name[name])
+            rows.append({
+                "variant": name, "placed": s["placed"], "filled": s["filled"], "not filled": s["not_filled"],
+                "fill rate": _pct(s["fill_rate"]), "median limit offset (ATR)": _f(s["median_offset_atr"], 2),
+            })
+    return _md(rows)
+
+
+def skipped_ict_md(results: list[VariantResult]) -> str:
+    """Skipped-signal counts per model / TF / TP / time filter (direction filter off: it only removes signals)."""
+    rows = []
+    for r in results:
+        v = r.v
+        if v.direction:
+            continue
+        row = {"model": v.model, "entry TF": v.entry_tf, "TP mode": v.tp_mode, "time filter": v.time_filter,
+               "simulated": len(r.trades)}
+        row.update({k: r.skipped.get(k, 0) for k in ICT_SKIP_REASONS})
+        row["other"] = sum(n for k, n in r.skipped.items() if k not in ICT_SKIP_REASONS)
+        rows.append(row)
+    return _md(rows)
+
+
+def _ict_charts(by_name: dict[str, VariantResult], table: pd.DataFrame, best: dict[str, str], out_dir) -> list[str]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    surface, ink, muted, grid = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
+    names = []
+    fig, ax = plt.subplots(figsize=(10, 4.8), facecolor=surface)
+    ax.set_facecolor(surface)
+    for m in MODELS:
+        if m not in best:
+            continue
+        t = by_name[best[m]].trades
+        t = t[t["taken"].astype(bool)].sort_values("signal_time")
+        if t.empty:
+            continue
+        eq = t["r"].cumsum().to_numpy()
+        ax.plot(t["signal_time"], eq, color=COLORS[m], lw=2, label=f"{m}: {best[m]}")
+        ax.annotate(f"{m}  {eq[-1]:+.0f}R", (t["signal_time"].iloc[-1], eq[-1]), xytext=(4, 0),
+                    textcoords="offset points", color=ink, fontsize=8, va="center")
+    ax.axhline(0, color=muted, lw=0.8)
+    ax.grid(color=grid, lw=0.6)
+    ax.set_ylabel("cumulative R (one position at a time)", color=muted)
+    ax.set_title("Equity in R of each model's best eligible (M5) variant, development period", color=ink, fontsize=11)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=7.5, frameon=False, loc="best")
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "07_equity.png", dpi=110, facecolor=surface)
+    plt.close(fig)
+    names.append("07_equity.png")
+
+    fig, axes = plt.subplots(1, len(MODELS), figsize=(12, 4.8), sharey=True, facecolor=surface)
+    for ax, m in zip(axes, MODELS):
+        ax.set_facecolor(surface)
+        g = table[(table["setup"] == m) & (table["n"] > 0)].sort_values("expectancy_R").reset_index(drop=True)
+        for i, r in g.iterrows():
+            c = COLORS[m] if r["eligible"] else "#9a9994"
+            ax.plot([i, i], [r["ci95_low"], r["ci95_high"]], color=c, lw=1, alpha=0.6)
+            ax.plot(i, r["expectancy_R"], "o", ms=4, color=c, mfc=c if r["eligible"] else surface)
+        ax.axhline(0, color=muted, lw=0.8)
+        ax.grid(axis="y", color=grid, lw=0.6)
+        ax.set_title(MODEL_NAMES[m].split(" (")[0], color=ink, fontsize=10)
+        ax.set_xticks([])
+        ax.set_xlabel("variants, sorted by expectancy", color=muted, fontsize=8)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    axes[0].set_ylabel("expectancy R per trade (95% CI)", color=muted)
+    fig.suptitle("Expectancy of every variant: filled = eligible (M5 entry), hollow grey = comparison only (M15)",
+                 color=ink, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_dir / "07_expectancy.png", dpi=110, facecolor=surface)
+    plt.close(fig)
+    names.append("07_expectancy.png")
+    return names
+
+
+def ict_test_section_md(selected: list[str]) -> list[str]:
+    """Lines of the Test set section before Task 8 runs it: not-run text, or pending with the selected names."""
+    if not selected:
+        body = [TEST_NOT_RUN_TEXT, ""]
+    elif (config.REPORTS_DIR / MARKER_NAME).exists():
+        body = [f"Run once; see reports/{MARKER_NAME}.", ""]
+    else:
+        body = ["Not yet run. Selected: " + ", ".join(f"`{n}`" for n in selected) + ".", ""]
+    return ["", research.TEST_HEADING, ""] + body
+
+
+def build_ict_results(
+    results: list[VariantResult], table: pd.DataFrame, out_dir, runtime_s: float, smoke: bool,
+    boxes: pd.DataFrame | None = None,
+) -> str:
+    """Markdown for everything below the pre-registration marker. `boxes` = asian_boxes(M1) for the Model 5
+    box-height table (None = not shown)."""
+    by_name = {r.v.name: r for r in results}
+    elig = table[table["eligible"]]
+    grid = ict_grid()
+    n_pre, e_pre = len(grid), sum(v.eligible for v in grid)
+    cum, cum_e = BATCH1_VARIANTS + len(table), BATCH1_ELIGIBLE + len(elig)
+    best: dict[str, str] = {}
+    for m in MODELS:
+        sel = table[(table["setup"] == m) & table["selected"]]
+        top = research.top_variants(table, m, 1)
+        if len(sel):
+            best[m] = sel.iloc[0]["name"]
+        elif len(top):
+            best[m] = top.iloc[0]["name"]
+    charts = _ict_charts(by_name, table, best, out_dir)
+    outcomes = {m: research.selection_outcome(table, m) for m in MODELS}
+    n_selected = int(table["selected"].sum())
+    hi = research._dev_bounds()[1]
+    exit_after = sum(
+        int((r.trades["taken"].astype(bool) & (r.trades["exit_time"] > hi)).sum()) for r in results if len(r.trades)
+    )
+    n_null = int(table["null_runs"].gt(0).sum())
+
+    L = ["", "## Results — development period 2022-05-16 .. 2025-10-23", ""]
+    if smoke:
+        L += ["**SMOKE RUN — a handful of variants and very few null repeats; not a result.**", ""]
+    L += [
+        f"Generated by `src/xauai/research_ict.py` at {datetime.now():%Y-%m-%d %H:%M} (local), runtime "
+        f"{runtime_s / 60:.1f} min. Every number below comes from that script. **The test set (2025-10-24 .. "
+        f"2026-10-23) has NOT been touched**: no trade below has a signal time after {hi}.",
+        "",
+        f"Variants tried: **{len(table)}** (pre-registered: {n_pre}). Eligible for selection (M5 entries): "
+        f"**{len(elig)}** (pre-registered: {e_pre}). Together with batch 1 ({BATCH1_VARIANTS} variants, "
+        f"{BATCH1_ELIGIBLE} eligible) that is **{cum}** variants (**{cum_e}** eligible) tried on the same "
+        "development data.",
+        "",
+        "### In plain words",
+        "",
+    ]
+    pos = int((elig["expectancy_R"] > 0).sum())
+    L += [
+        "- *R* is the size of the trade's own stop: -1R = a normal stop-out, +2R = won twice the risk. *Expectancy* "
+        "is the average R per trade after spread, slippage and swap; above 0 means the rules made money in this "
+        "period. The *95% CI* is the range the true average plausibly lies in; if it includes 0, the result could "
+        "be luck.",
+        f"- Of the {len(elig)} eligible M5 versions, {pos} had a positive average; the median eligible version "
+        f"averaged {_f(elig['expectancy_R'].median())}R per trade.",
+        f"- To be selected a version needed at least {config.SELECT_MIN_N} trades, a positive average in every "
+        f"calendar year 2022-2025, and to beat at least {config.NULL_BEAT:.0%} of {config.NULL_REPEATS} random-entry "
+        "runs with the same sessions, directions and stops (Models 1 and 3: random limit orders at the same kind "
+        f"of distance from price). {n_null} version(s) got far enough to be compared with random entries.",
+        f"- {cum} versions have now been tried across both batches ({cum_e} of them eligible). With this many "
+        "tries, luck is likely: a few versions will look good by chance alone. That is why the random-entry check "
+        "and the untouched test year exist.",
+        "- The evening question (losses in Philippine evening hours: market or trader?) is answered per model in "
+        "\"Results by session and by Philippine time\" below.",
+    ]
+    if n_selected:
+        L.append(f"- **{n_selected} version(s) passed** and go to the one-time test: "
+                 + ", ".join(f"`{n}`" for n in table.loc[table["selected"], "name"])
+                 + ". Passing here is not proof; only the untouched test year can confirm it.")
+    else:
+        L.append("- **No version passed, so nothing goes to the test set.** As exact rules with real costs, these "
+                 "ICT entry models did not show an edge in 2022-2025. That is a valid, useful result.")
+    L += ["", "### Selection outcome per model", "",
+          _md([{"model": MODEL_NAMES[m], "outcome": outcomes[m][0], "details": outcomes[m][1]} for m in MODELS]),
+          "", "### Charts", ""]
+    L += [f"![{c}]({c})" for c in charts]
+    L += ["", "Equity chart: each model's selected variant, or (if none was selected) its top eligible variant by "
+          f"expectancy among those with >= {config.SELECT_MIN_N} trades — shown for comparison, not as a selection.",
+          ""]
+
+    L += ["### Top 3 eligible variants per model", "",
+          f"Ranked by one-position expectancy among eligible variants with >= {config.SELECT_MIN_N} trades (filled up "
+          "with smaller ones only if fewer than 3 have that many). *One position* = a new signal is ignored while that "
+          "variant's order or trade is open (used for selection and the test). *Every signal* = every signal is "
+          "traded, overlapping allowed. PF = profit factor (gross won / gross lost). Max DD = largest peak-to-trough "
+          "fall of the R equity curve. Cost sensitivity = the same variant re-run with total cost per trade "
+          "0.50 / 0.75 instead of >= 0.35.", ""]
+    for m in MODELS:
+        L += [f"#### {MODEL_NAMES[m]}", ""]
+        top = research.top_variants(table, m)
+        if top.empty:
+            L += ["_no eligible variant had any trade_", ""]
+        for _, row in top.iterrows():
+            L += [research.detail_md(by_name[row["name"]], row), ""]
+
+    nt = table[table["null_runs"] > 0].sort_values("expectancy_R", ascending=False)
+    L += ["### Null baseline (random entries)", "",
+          f"Computed only for eligible variants that already pass n >= {config.SELECT_MIN_N} and every-year > 0. "
+          "Each random run takes the same number of entries at random entry-TF bars inside the variant's time filter, "
+          "in the same sessions with the same directions; each gets a (stop distance, target distance in R) pair "
+          "drawn from the variant's own trades. Model 5: market entry at that bar. Models 1 and 3: a limit order at "
+          "a drawn offset (in ATR) from the previous bar's close, live for the same fill window and time filter. "
+          "Same simulator, one position or order at a time. *Beats* = share of random runs whose expectancy is not "
+          "above the variant's.", ""]
+    L += [_md([{"variant": r["name"], "n": int(r["n"]), "exp R": _f(r["expectancy_R"]),
+                "random runs": int(r["null_runs"]), "random mean R": _f(r["null_mean"]),
+                "random 5th R": _f(r["null_p05"]), "random 95th R": _f(r["null_p95"]),
+                "beats": _pct(r["beat_share"])} for _, r in nt.iterrows()]), ""]
+
+    sens = table[table["exp_cost_0.50"].notna()].sort_values(["setup", "expectancy_R"], ascending=[True, False])
+    L += [f"### Cost sensitivity (eligible variants with >= {config.SELECT_MIN_N} trades, plus each model's top 3)",
+          "",
+          _md([{"variant": r["name"], "n": int(r["n"]), "exp R base": _f(r["expectancy_R"]),
+                "exp R @ 0.50": _f(r["exp_cost_0.50"]), "exp R @ 0.75": _f(r["exp_cost_0.75"]),
+                "every signal base": _f(r["all_expectancy_R"]), "every signal @ 0.50": _f(r["all_exp_cost_0.50"]),
+                "every signal @ 0.75": _f(r["all_exp_cost_0.75"])} for _, r in sens.iterrows()]), ""]
+
+    L += ["### Cost as a share of the stop, per entry timeframe", "",
+          "cost = spread (min $0.30) + $0.05 slippage, in price, from the fill bar (limit fills too); SL distance = "
+          "fill to stop. Over unique simulated trades (the same trade shared by several variants counts once). A 0.35 "
+          "cost on a 1.00 stop means every trade starts 0.35R behind.", "", research.cost_share_md(results), ""]
+
+    L += ["### Results by session and by Philippine time", "",
+          f"For each model's `{BASE_SUFFIX[1:]}` variant. Session = the session the trade was filled in (asia / "
+          "london / ny, as in batch 1; none = outside all three). PH band = fill time in Asia/Manila: 08-18 (day), "
+          "18-02 (evening), 02-08 (night). n / exp R / total R = one position at a time; the every-signal columns "
+          "trade every signal.", ""]
+    L += session_band_md(by_name)
+
+    L += ["### Model 5: Asian box height and stop size", "",
+          "Box height = high - low of each Asian range box (20:00-24:00 New York) in the development period. Stop "
+          f"size and cost / stop over every simulated trade of `m5{BASE_SUFFIX}`. In $ (price units).", "",
+          model5_md(by_name, boxes), ""]
+
+    L += ["### Models 1 and 3: fill rate and limit offset", "",
+          "Placed = orders that were placed (signals not skipped at placement for no bar / stale after a gap / "
+          "Friday close). Filled = orders whose limit was touched (including fills then skipped for gap_through_sl, "
+          "sl_behind_fill or a target problem). Fill rate = filled / placed, over every order. Median limit offset = "
+          "distance of the limit from the signal close in ATR14 units (positive = better price), over filled trades.",
+          "", fill_md(by_name), ""]
+
+    L += ["### Entry-timeframe comparison (M15 rows: comparison only — never selected or tested)", "",
+          "One row per model and entry timeframe, over its 24 variants (TP mode x direction filter x time filter).",
+          "", research.comparison_md(table), ""]
+
+    L += ["### Skipped signals by reason", "",
+          "Per model, TF, TP mode and time filter, without the direction filter (it only removes signals first). "
+          "no_entry_bar = no M1 bar at the entry / placement time; stale_after_gap = right after a > 25 h gap; "
+          "entry_after_friday_close = at/after Friday 22:00; sl_behind_fill = the stop is on the wrong side of the "
+          "fill after costs; no_target = no next level; target_too_close_or_passed = target < 1R from the fill; "
+          "not_filled = the limit was never touched in its window (or only outside the time filter); gap_through_sl = "
+          "the fill bar opened beyond the stop. simulated = trades (limit models: filled orders).", "",
+          skipped_ict_md(results), ""]
+
+    L += ["### All variants", "",
+          "Sorted by model, then one-position expectancy. n taken = one position at a time; n signals = every "
+          "simulated trade (limit models: every filled order).", "", research.all_variants_md(table), ""]
+
+    L += ["### Caveats", "",
+          f"- Trades opened near 2025-10-23 may exit after it ({exit_after} taken trades across all variants exit "
+          f"after {hi}); they are kept, with their full outcome, because their signal is in the development period.",
+          "- Historical swap is scaled by price with the 2026-10-23 close as the reference (the current swap snapshot "
+          "is from then), as in batch 1. This uses one price from after the development period, only to scale swap.",
+          "- Limit-order null: random orders are placed only inside the time filter, while real orders may be placed "
+          "before a window and fill inside it. Real trades are labelled with the session of the fill; random ones "
+          "with the session of the placement bar.",
+          "- Model 5 stops are not capped (designer's call, fixed before any result).",
+          f"- {cum} variants have been tried across both batches; with {cum_e} eligible, a few can pass the "
+          "development checks by luck. The test set is the only honest check.",
+          "- **The test set has NOT been touched.** It is run once, in Task 8, only for selected variants.", ""]
+    L += ict_test_section_md(table.loc[table["selected"], "name"].tolist())
+    return "\n".join(L)
+
+
+def write_ict_report(results_md: str, path) -> None:
+    """Keep everything up to and including MARKER from reports/07_ict_models.md byte for byte (line endings
+    untouched); write it plus `results_md` to `path` (the report itself, or the smoke copy)."""
+    with open(config.REPORTS_DIR / REPORT_NAME, encoding="utf-8", newline="") as f:
+        src = f.read()
+    if MARKER not in src:
+        raise RuntimeError(f"marker missing from {REPORT_NAME}")
+    pre = src.split(MARKER)[0] + MARKER + "\n"
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(pre + results_md)
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Batch 2 ICT models: development backtests, null baseline, selection")
+    ap.add_argument("--smoke", action="store_true",
+                    help=f"run {len(SMOKE_VARIANTS)} variants with {SMOKE_REPEATS} null repeats; writes only to "
+                         f"data/research/{SMOKE_DIR}/")
+    ap.add_argument("--final", action="store_true", help="test period, run once (Task 8; not implemented yet)")
+    args = ap.parse_args(argv)
+    if args.final:
+        raise SystemExit("--final (one-time test period) is Task 8 and is not implemented yet")
+    t0 = time.time()
+    smoke = args.smoke
+    out_dir = RESEARCH_DATA_DIR / SMOKE_DIR if smoke else config.REPORTS_DIR
+    data_dir = RESEARCH_DATA_DIR / SMOKE_DIR if smoke else RESEARCH_DATA_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    repeats = SMOKE_REPEATS if smoke else config.NULL_REPEATS
+    log = research._log
+
+    inp = research.load_inputs()
+    log("inputs loaded", t0)
+    grid = ict_grid()
+    if smoke:
+        grid = [v for v in grid if v.name in SMOKE_VARIANTS]
+    results: list[VariantResult] = []
+    for i, v in enumerate(grid):
+        tr, sk = run_ict_detail(v, inp, config.DEV_START, config.DEV_END)
+        results.append(VariantResult(v, tr, sk))
+        log(f"{i + 1}/{len(grid)} {v.name}: {int(tr['taken'].sum())} taken / {len(tr)} trades", t0)
+    research.assert_dev_only(results)
+
+    table = build_ict_table(results)
+    need_sens = set(table.loc[table["eligible"] & (table["n"] >= config.SELECT_MIN_N), "name"])
+    for m in MODELS:
+        need_sens |= set(research.top_variants(table, m)["name"])
+    if smoke:
+        need_sens = {r.v.name for r in results if len(r.trades)}
+    for res in results:
+        if res.v.name in need_sens:
+            for c in config.SENSITIVITY_TOTAL_COSTS:
+                res.sens[c] = run_ict_detail(res.v, inp, config.DEV_START, config.DEV_END, total_cost=c)[0]
+            log(f"cost sensitivity {res.v.name}", t0)
+    research.assert_dev_only(results)
+
+    need_null = set(table.loc[research.pre_null_pass(table), "name"])
+    if smoke:
+        need_null = {r.v.name for r in results if r.v.eligible and r.trades["taken"].astype(bool).any()}
+    for res in results:
+        if res.v.name in need_null:
+            res.null = ict_null(res.v, res.trades, inp, repeats=repeats)
+            log(f"null baseline {res.v.name}: {repeats} runs", t0)
+
+    table = build_ict_table(results)
+    table.to_parquet(data_dir / "07_variants.parquet", index=False)
+    sel = table.loc[table["selected"], "name"].tolist()
+    (data_dir / "07_selected.json").write_text(
+        json.dumps({"generated": datetime.now().isoformat(timespec="seconds"), "smoke": smoke, "selected": sel},
+                   indent=2), encoding="utf-8")
+    text = build_ict_results(results, table, out_dir, time.time() - t0, smoke, boxes=_boxes(inp))
+    write_ict_report(text, out_dir / (SMOKE_REPORT if smoke else REPORT_NAME))
+    log(f"report written to {out_dir}; selected: {sel or 'none'}", t0)
+
+
+if __name__ == "__main__":
+    main()
